@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '**.h'
+      - '**.c'
+      - '.github/workflows/ci.yml'
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  test-x86:
+    name: Test (x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Sanity check
+        run: gcc -O3 -Wall -Wextra -o test_plum test_plum.c && ./test_plum
+      - name: SMHasher
+        run: gcc -O3 -Wall -Wextra -o smhasher_plums smhasher_plums.c -lm && ./smhasher_plums
+      - name: Benchmark
+        run: gcc -O3 -Wall -Wextra -o bench_compare bench_compare.c -lm && ./bench_compare
+
+  test-arm:
+    name: Test (aarch64)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Sanity check
+        run: gcc -O3 -Wall -Wextra -o test_plum test_plum.c && ./test_plum
+      - name: SMHasher
+        run: gcc -O3 -Wall -Wextra -o smhasher_plums smhasher_plums.c -lm && ./smhasher_plums
+      - name: Benchmark
+        run: gcc -O3 -Wall -Wextra -o bench_compare bench_compare.c -lm && ./bench_compare
