@@ -1,0 +1,79 @@
+# Universal Coding Workflow Configuration
+# Override any value by creating .kimi/workflow-config.toml in your project root.
+
+[workflow]
+# Continuation behavior
+continuation_by_default = true
+# Ask first if estimated API cost exceeds this (USD)
+cost_threshold_usd = 0.10
+# Ask first if estimated wall time exceeds this (minutes)
+time_threshold_min = 10
+
+[hierarchy]
+# Default limits for task decomposition
+stories_per_epic = 5
+tasks_per_story = 7
+subtasks_per_task = 4
+
+[agents]
+# When to spawn specialized agents
+plan_agent_min_files = 3        # min files touched to trigger plan agent
+coder_agent_max_files = 3       # max files for a single coder agent
+review_agent_trigger = true     # always run review after tests
+agent_output_max_lines = 50     # if agent returns more, write to file instead
+
+[explore]
+max_files = 3                   # scope limit for explore agent
+output_max_lines = 10           # fact summary line limit
+
+[tests]
+required_after_coder = true     # spawn test agent after every coder agent
+framework_preference = "existing"  # "existing" | "catch2" | "gtest" | "pytest" | "jest"
+coverage_check = true           # review agent verifies coverage
+
+[backup]
+enabled = true
+retention_count = 10            # keep last N backups
+triggers = ["story_complete", "destructive_op", "every_n_subtasks", "explicit"]
+every_n_subtasks = 5
+method = "git-stash"            # "git-stash" | "tar"
+tar_exclude = [".kimi/backups", "node_modules", ".git", "target", "build", "dist"]
+
+[session]
+never_do_max_entries = 50       # archive oldest 30 when exceeded
+archive_oldest_count = 30
+# Session ID format: "date-pid" or "uuid"
+id_format = "date-pid"
+
+[constraints]
+# Hard constraint categories checked before every turn
+check_file_ops = true
+check_git_ops = true
+check_external_calls = true
+check_code_patterns = true
+check_workflow = true
+
+[proactive_tasks]
+# Auto-add tasks when discovered
+missing_tests = true
+security_issues = true
+performance_regressions = true
+documentation_drift = true
+dead_code = true
+obsolete_files = true
+dependency_updates = false      # off by default (can be noisy)
+
+[maintenance]
+# Maintenance agent settings
+check_unused_files = true
+check_dead_code = true
+check_outdated_deps = false     # off by default
+check_doc_drift = true
+max_deletions_per_run = 5       # safety limit
+require_build_pass = true
+
+[token_efficiency]
+verbose_output_dir = ".kimi/artifacts"
+use_tables_for_multifile = true
+reference_over_quote = true
+max_examples = 3
