@@ -995,6 +995,52 @@ size_t pe_file_lines(pe_t *pe, const char *path) {
     return f ? f->nlines : 0;
 }
 
+int pe_file_rdlock(pe_t *pe, const char *path) {
+    pthread_mutex_lock(&pe->sched_lock);
+    pe_file_t *f = ht_find(pe, path);
+    pthread_mutex_unlock(&pe->sched_lock);
+    if (!f) return -1;
+    pthread_rwlock_rdlock(&f->lock);
+    return 0;
+}
+
+void pe_file_rdunlock(pe_t *pe, const char *path) {
+    pthread_mutex_lock(&pe->sched_lock);
+    pe_file_t *f = ht_find(pe, path);
+    pthread_mutex_unlock(&pe->sched_lock);
+    if (f) pthread_rwlock_unlock(&f->lock);
+}
+
+int pe_file_wrlock(pe_t *pe, const char *path) {
+    pthread_mutex_lock(&pe->sched_lock);
+    pe_file_t *f = ht_find(pe, path);
+    pthread_mutex_unlock(&pe->sched_lock);
+    if (!f) return -1;
+    pthread_rwlock_wrlock(&f->lock);
+    return 0;
+}
+
+void pe_file_wrunlock(pe_t *pe, const char *path) {
+    pthread_mutex_lock(&pe->sched_lock);
+    pe_file_t *f = ht_find(pe, path);
+    pthread_mutex_unlock(&pe->sched_lock);
+    if (f) pthread_rwlock_unlock(&f->lock);
+}
+
+bool pe_file_exists(pe_t *pe, const char *path) {
+    pthread_mutex_lock(&pe->sched_lock);
+    pe_file_t *f = ht_find(pe, path);
+    pthread_mutex_unlock(&pe->sched_lock);
+    return f != NULL;
+}
+
+size_t pe_file_size(pe_t *pe, const char *path) {
+    pthread_mutex_lock(&pe->sched_lock);
+    pe_file_t *f = ht_find(pe, path);
+    pthread_mutex_unlock(&pe->sched_lock);
+    return f ? f->size : 0;
+}
+
 /* ═══════════════════════════════════════════════════════════
  * Undo
  * ═══════════════════════════════════════════════════════════ */

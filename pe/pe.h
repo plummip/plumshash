@@ -74,6 +74,15 @@ void           pe_edit_free(pe_edit_t *edit);
 const char    *pe_file_data(pe_t *pe, const char *path, size_t *size);
 size_t         pe_file_lines(pe_t *pe, const char *path);
 
+/* Thread-safe file access: hold rdlock while reading data.
+ * pe_file_data is safe when (a) no concurrent edits, or (b) rdlock held. */
+int            pe_file_rdlock(pe_t *pe, const char *path);
+void           pe_file_rdunlock(pe_t *pe, const char *path);
+int            pe_file_wrlock(pe_t *pe, const char *path);
+void           pe_file_wrunlock(pe_t *pe, const char *path);
+bool           pe_file_exists(pe_t *pe, const char *path);     /* cached? */
+size_t         pe_file_size(pe_t *pe, const char *path);       /* byte size */
+
 /* Diff (line-hash based, O(N)) */
 char          *pe_diff(pe_t *pe, const char *path, size_t context);
 
@@ -622,6 +631,13 @@ const char *pe_edit_error(pe_edit_t *e) { return e->error ? e->error : "no error
 const char *pe_file_data(pe_t *pe, const char *p, size_t *sz) { pe_file_t *f; pthread_mutex_lock(&pe->sched_lock); f = ht_find(pe, p); pthread_mutex_unlock(&pe->sched_lock); if (!f) { if (sz) *sz = 0; return NULL; } if (sz) *sz = f->size; return f->data; }
 size_t pe_file_lines(pe_t *pe, const char *p) { pthread_mutex_lock(&pe->sched_lock); pe_file_t *f = ht_find(pe, p); pthread_mutex_unlock(&pe->sched_lock); return f ? f->nlines : 0; }
 
+int pe_file_rdlock(pe_t *pe, const char *p) { pthread_mutex_lock(&pe->sched_lock); pe_file_t *f = ht_find(pe, p); pthread_mutex_unlock(&pe->sched_lock); if (!f) return -1; pthread_rwlock_rdlock(&f->lock); return 0; }
+void pe_file_rdunlock(pe_t *pe, const char *p) { pthread_mutex_lock(&pe->sched_lock); pe_file_t *f = ht_find(pe, p); pthread_mutex_unlock(&pe->sched_lock); if (f) pthread_rwlock_unlock(&f->lock); }
+int pe_file_wrlock(pe_t *pe, const char *p) { pthread_mutex_lock(&pe->sched_lock); pe_file_t *f = ht_find(pe, p); pthread_mutex_unlock(&pe->sched_lock); if (!f) return -1; pthread_rwlock_wrlock(&f->lock); return 0; }
+void pe_file_wrunlock(pe_t *pe, const char *p) { pthread_mutex_lock(&pe->sched_lock); pe_file_t *f = ht_find(pe, p); pthread_mutex_unlock(&pe->sched_lock); if (f) pthread_rwlock_unlock(&f->lock); }
+bool pe_file_exists(pe_t *pe, const char *p) { pthread_mutex_lock(&pe->sched_lock); pe_file_t *f = ht_find(pe, p); pthread_mutex_unlock(&pe->sched_lock); return f != NULL; }
+size_t pe_file_size(pe_t *pe, const char *p) { pthread_mutex_lock(&pe->sched_lock); pe_file_t *f = ht_find(pe, p); pthread_mutex_unlock(&pe->sched_lock); return f ? f->size : 0; }
+
 void pe_edit_free(pe_edit_t *ed) {
     if (!ed) return; pe_t *pe = ed->pe;
     pthread_mutex_lock(&pe->sched_lock);
@@ -977,7 +993,9 @@ static const char *help_text =
     "PE DAEMON COMMANDS\n"
     "──────────────────\n"
     "CACHE <path>                    Load file into cache\n"
+    "EXISTS <path>                   Check if file is cached\n"
     "INFO <path>                     Show line count and byte size\n"
+    "SIZE <path>                     Show byte size only\n"
     "GET <path>                      Return full file contents\n"
     "INSERT <path> <L> <C> <len>\\n<bytes>  Insert content at line:col\n"
     "DELETE <path> <sl> <sc> <el> <ec>      Delete range [start, end)\n"
@@ -1006,7 +1024,7 @@ static int parse_cmd(char *line, client_t *c) {
     strncpy(c->cmd,tok,sizeof(c->cmd)-1); c->cmd[sizeof(c->cmd)-1]='\0';
     #define NEXT() (tok=strtok(NULL," \t"))
     #define NEED() do{if(!NEXT())return -1;}while(0)
-    if(!strcmp(c->cmd,"CACHE")||!strcmp(c->cmd,"GET")||!strcmp(c->cmd,"INFO")||!strcmp(c->cmd,"UNDO")||!strcmp(c->cmd,"BRANCH")||!strcmp(c->cmd,"SWITCH")||!strcmp(c->cmd,"DELETE_BRANCH")){NEED();strncpy(c->path,tok,PATH_MAXLEN-1);return 0;}
+    if(!strcmp(c->cmd,"CACHE")||!strcmp(c->cmd,"GET")||!strcmp(c->cmd,"INFO")||!strcmp(c->cmd,"EXISTS")||!strcmp(c->cmd,"SIZE")||!strcmp(c->cmd,"UNDO")||!strcmp(c->cmd,"BRANCH")||!strcmp(c->cmd,"SWITCH")||!strcmp(c->cmd,"DELETE_BRANCH")){NEED();strncpy(c->path,tok,PATH_MAXLEN-1);return 0;}
     if(!strcmp(c->cmd,"MERGE")){NEED();strncpy(c->path,tok,PATH_MAXLEN-1);return 0;}
     if(!strcmp(c->cmd,"DIFF")){NEED();strncpy(c->path,tok,PATH_MAXLEN-1);if(NEXT())c->line=strtoul(tok,NULL,10);return 0;}
     if(!strcmp(c->cmd,"FLUSH")||!strcmp(c->cmd,"SYNC")||!strcmp(c->cmd,"QUIT")||!strcmp(c->cmd,"KILL")||!strcmp(c->cmd,"BEGIN")||!strcmp(c->cmd,"COMMIT")||!strcmp(c->cmd,"ROLLBACK")||!strcmp(c->cmd,"BRANCHES")||!strcmp(c->cmd,"HELP"))return 0;
@@ -1023,6 +1041,8 @@ static int parse_cmd(char *line, client_t *c) {
 static void exec_cmd(client_t *c) {
     if (!strcmp(c->cmd, "HELP")) { respond(c, help_text); return; }
     if (!strcmp(c->cmd, "CACHE")) { respond(c, pe_cache_file(g_pe,c->path)==0?"OK\n":"ERR\n"); return; }
+    if (!strcmp(c->cmd, "EXISTS")) { respond(c, pe_file_exists(g_pe,c->path)?"YES\n":"NO\n"); return; }
+    if (!strcmp(c->cmd, "SIZE")) { size_t sz = pe_file_size(g_pe,c->path); if(!sz && !pe_file_exists(g_pe,c->path)){respf(c,"ERR %s\n",c->path);return;} respf(c,"SIZE %zu\n",sz); return; }
     if (!strcmp(c->cmd, "FLUSH")) { respf(c, "FLUSHED %zu\n", pe_flush(g_pe)); return; }
     if (!strcmp(c->cmd, "SYNC")) { respond(c, pe_sync(g_pe)==0?"SYNCED 0\n":"ERR sync\n"); return; }
     if (!strcmp(c->cmd, "QUIT")) { respond(c, "BYE\n"); c->fd = -2; return; }
