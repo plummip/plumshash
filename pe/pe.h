@@ -133,6 +133,7 @@ const char    *pe_branch_current(pe_t *pe);
 
 typedef struct {
     char       *path, *data, *original;
+    uint64_t    path_hash;        /* cached FNV-1a */
     size_t      size, original_size;
     size_t     *lines, nlines;
     _Atomic int dirty;
@@ -197,7 +198,7 @@ static int ht_grow(pe_t *pe) {
     for (size_t i = 0; i < oc; i++) {
         pe_file_t *e = old[i];
         if (!e || e == pe->tombstone) continue;
-        size_t idx = pe_hash(e->path) % nc;
+        size_t idx = e->path_hash % nc;
         while (n[idx]) idx = (idx + 1) % nc;
         n[idx] = e;
     }
@@ -207,11 +208,13 @@ static int ht_grow(pe_t *pe) {
 
 static pe_file_t *ht_find(pe_t *pe, const char *restrict path) {
     if (!pe->files_cap) return NULL;
-    size_t idx = pe_hash(path) % pe->files_cap, orig = idx;
+    uint64_t h = pe_hash(path);
+    size_t idx = h % pe->files_cap, orig = idx;
     do {
         pe_file_t *e = pe->files[idx];
         if (!e) return NULL;
-        if (e != pe->tombstone && strcmp(e->path, path) == 0) return e;
+        if (e != pe->tombstone && e->path_hash == h &&
+            strcmp(e->path, path) == 0) return e;
         idx = (idx + 1) % pe->files_cap;
     } while (idx != orig);
     return NULL;
@@ -220,9 +223,11 @@ static pe_file_t *ht_find(pe_t *pe, const char *restrict path) {
 static int ht_insert(pe_t *pe, pe_file_t *entry) {
     if (pe->files_count * 100 >= pe->files_cap * HT_LOAD_PCT)
         if (ht_grow(pe) != 0) return -1;
-    size_t idx = pe_hash(entry->path) % pe->files_cap;
+    uint64_t h = entry->path_hash;
+    size_t idx = h % pe->files_cap;
     while (pe->files[idx] && pe->files[idx] != pe->tombstone) {
-        if (strcmp(pe->files[idx]->path, entry->path) == 0) return -1;
+        if (pe->files[idx]->path_hash == h &&
+            strcmp(pe->files[idx]->path, entry->path) == 0) return -1;
         idx = (idx + 1) % pe->files_cap;
     }
     pe->files[idx] = entry; pe->files_count++;
@@ -525,6 +530,7 @@ int pe_cache_file(pe_t *pe, const char *path) {
     if (f) return 0;
     f = calloc(1, sizeof(pe_file_t)); if (!f) return -1;
     if (!(f->path = strdup(path))) { free(f); return -1; }
+    f->path_hash = pe_hash(f->path);
     if (file_load(pe, path, &f->data, &f->size)) { free(f->path); free(f); return -1; }
     if (build_lines(f->data, f->size, &f->lines, &f->nlines)) { free(f->data); free(f->path); free(f); return -1; }
     if ((f->original = malloc(f->size + 1))) { memcpy(f->original, f->data, f->size); f->original[f->size] = '\0'; f->original_size = f->size; }
@@ -566,6 +572,7 @@ int pe_edit_submit(pe_t *pe, pe_edit_t *ed) {
     if (!f) {
         f = calloc(1, sizeof(pe_file_t)); if (!f) return -1;
         if (!(f->path = strdup(ed->path))) { free(f); return -1; }
+        f->path_hash = pe_hash(f->path);
         if (file_load(pe, ed->path, &f->data, &f->size)) { free(f->path); free(f); return -1; }
         if (build_lines(f->data, f->size, &f->lines, &f->nlines)) { free(f->data); free(f->path); free(f); return -1; }
         if ((f->original = malloc(f->size + 1))) { memcpy(f->original, f->data, f->size); f->original[f->size] = '\0'; f->original_size = f->size; }
@@ -791,7 +798,7 @@ bool pe_txn_active(pe_t *pe) { bool a; pthread_mutex_lock(&pe->sched_lock); a = 
 
 static pe_file_t *file_copy(pe_file_t *src) {
     pe_file_t *d = calloc(1, sizeof(pe_file_t)); if (!d) return NULL;
-    d->path = strdup(src->path); d->size = src->size;
+    d->path = strdup(src->path); d->path_hash = src->path_hash; d->size = src->size;
     if ((d->data = malloc(src->size+1))) { memcpy(d->data, src->data, src->size); d->data[src->size] = '\0'; }
     if (src->original && (d->original = malloc(src->original_size+1))) { memcpy(d->original, src->original, src->original_size); d->original[src->original_size] = '\0'; d->original_size = src->original_size; }
     d->nlines = src->nlines; if ((d->lines = malloc(src->nlines * sizeof(size_t)))) memcpy(d->lines, src->lines, src->nlines * sizeof(size_t));
@@ -806,7 +813,7 @@ static int branch_snap(pe_t *pe, pe_branch_t *br) {
     for (size_t i = 0; i < pe->files_cap; i++) {
         pe_file_t *f = pe->files[i]; if (!f || f == pe->tombstone) continue;
         pe_file_t *c = file_copy(f); if (!c) continue;
-        size_t idx = pe_hash(c->path) % br->cap;
+        size_t idx = c->path_hash % br->cap;
         while (br->files[idx] && br->files[idx] != br->tomb) idx = (idx + 1) % br->cap;
         br->files[idx] = c; br->count++;
     }
@@ -904,7 +911,7 @@ int pe_branch_merge(pe_t *pe, const char *from, const char *to) {
     for (size_t i = 0; i < fb->cap; i++) { pe_file_t *ff = fb->files[i]; if (!ff || ff == fb->tomb) continue;
         pe_file_t *tf = ht_find(pe, ff->path);
         if (!tf) { pe_file_t *cp = file_copy(ff); if (cp) { if (!pe->files_cap || pe->files_count*100 >= pe->files_cap*70) ht_grow(pe);
-            size_t idx = pe_hash(cp->path) % pe->files_cap; while (pe->files[idx] && pe->files[idx] != pe->tombstone) idx=(idx+1)%pe->files_cap;
+            size_t idx = cp->path_hash % pe->files_cap; while (pe->files[idx] && pe->files[idx] != pe->tombstone) idx=(idx+1)%pe->files_cap;
             pe->files[idx] = cp; pe->files_count++; } continue; }
         bool fc = (!ff->original || ff->size != ff->original_size || memcmp(ff->data, ff->original, ff->size));
         bool tc = (!tf->original || tf->size != tf->original_size || memcmp(tf->data, tf->original, tf->size));
