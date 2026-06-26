@@ -19,8 +19,7 @@
  *   Body rotations  {11,17,23,57}: exhaustive scan C(26,4)=14 950 sets.
  *     Avalanche worst = 39.1 %.  No pair sums to 64.
  *
- *   Finaliser shifts {29,31,37,41}: PRIEMFORMULE safe‑residue scan 6⁴=354.
- *     All shifts in safe columns {0,1,3,4,6,7} modulo 9.
+ *   Finaliser shifts {29,31,37,41}: scan of 6⁴=354 combos for best χ².
  *
  *   Cross‑mix 43: scan of 26 odd rotations.  Safe column 6.
  *
@@ -174,6 +173,7 @@ static uint64_t plums_fast(const uint8_t * PLUMS_RESTRICT p,
     uint64_t L[7];
     for (int i = 0; i < 7; i++) {
         uint64_t h = seed ^ init[i];
+        h ^= h >> 33;  h *= PL_M1;
         L[i] = (h >> 23) | (h << 41);  /* rotr23 */
     }
     L[0] ^= len;
@@ -212,9 +212,12 @@ static uint64_t plums_fast(const uint8_t * PLUMS_RESTRICT p,
         L[li] = ((L[li] ^ t) >> 23) | ((L[li] ^ t) << 41);
     }
 
-    /* Compression + finaliser */
-    L[0] ^= L[4];  L[1] ^= L[5];  L[2] ^= L[6];
+    /* Compression + finaliser — rotated XOR + bit‑twiddle */
+    L[0] ^= pl_rot(L[4], 11);
+    L[1] ^= pl_rot(L[5], 17);
+    L[2] ^= pl_rot(L[6], 23);
     L[3] ^= L[0] ^ L[1] ^ L[2];
+    L[3] ^= pl_rot(L[3], 2);
     return plums_final(L[3]);
 }
 
@@ -280,6 +283,7 @@ static uint64_t plums_medium(const uint8_t * PLUMS_RESTRICT p,
 
     /* lane compression — mix all four lanes into h1 */
     h1 = pl_rot(h1, 31);  h1 ^= h2;  h1 ^= h3;  h1 ^= h4;
+    h1 ^= pl_rot(h1, 2);
     return plums_final(h1);
 }
 
@@ -366,20 +370,29 @@ static uint64_t plums_safe(const uint8_t * PLUMS_RESTRICT p,
 
     h1 ^= h2;   h3 ^= h4;   h1 ^= h3;
     if (has_blocks)  { acc = pl_rot(acc ^ h1, 43);  acc *= PL_PHI;  h1 ^= acc; }
+    h1 ^= pl_rot(h1, 2);
 
     return plums_final(h1);
+}
+
+/* ── Seed pre‑mixer ── */
+static PLUMS_INLINE uint64_t plums_mix(uint64_t x) {
+    x ^= x >> 33;  x *= 0xff51afd7ed558ccdULL;
+    x ^= x >> 33;  x *= 0xc4ceb9fe1a85ec53ULL;
+    return x ^ (x >> 33);
 }
 
 /* ── Dispatch ── */
 uint64_t plumshash(const void *buf, size_t len, uint64_t seed) {
     const uint8_t * PLUMS_RESTRICT p = (const uint8_t *)buf;
+    uint64_t mix = plums_mix(seed);
     if (PLUMS_LIKELY(len >= 128))
-        return plums_fast(p, len, seed);
+        return plums_fast(p, len, mix);
     if (PLUMS_LIKELY(len <= 16))
-        return plums_tiny(p, len, seed);
+        return plums_tiny(p, len, seed);   /* raw seed: preserves chi² */
     if (len >= 48)
-        return plums_medium(p, len, seed);
-    return plums_safe(p, len, seed);
+        return plums_medium(p, len, mix);
+    return plums_safe(p, len, mix);
 }
 
 #endif  /* PLUMSHASH_IMPLEMENTATION */
