@@ -88,6 +88,11 @@ static PLUMS_INLINE uint64_t pl_rot(uint64_t x, int k) {
     return (x << k) | (x >> (64 - k));
 }
 
+/* Dedicated rotr23 — on aarch64 fuses to single ROR insn */
+static PLUMS_INLINE uint64_t pl_rotr23(uint64_t x) {
+    return (x >> 23) | (x << 41);
+}
+
 static PLUMS_INLINE uint64_t pl_read64(const uint8_t *p) {
     uint64_t v;
     memcpy(&v, p, sizeof(v));
@@ -174,27 +179,27 @@ static uint64_t plums_fast(const uint8_t * PLUMS_RESTRICT p,
     for (int i = 0; i < 7; i++) {
         uint64_t h = seed ^ init[i];
         h ^= h >> 33;  h *= PL_M1;
-        L[i] = (h >> 23) | (h << 41);  /* rotr23 */
+        L[i] = pl_rotr23(h);  /* rotr23 */
     }
     L[0] ^= len;
 
     /* 7-lane: 56 bytes per iteration */
     while (PLUMS_LIKELY(p + 56 <= e)) {
         uint64_t v;
-        v = pl_read64(p); L[0] = ((L[0] ^ v) >> 23) | ((L[0] ^ v) << 41); p += 8;
-        v = pl_read64(p); L[1] = ((L[1] ^ v) >> 23) | ((L[1] ^ v) << 41); p += 8;
-        v = pl_read64(p); L[2] = ((L[2] ^ v) >> 23) | ((L[2] ^ v) << 41); p += 8;
-        v = pl_read64(p); L[3] = ((L[3] ^ v) >> 23) | ((L[3] ^ v) << 41); p += 8;
-        v = pl_read64(p); L[4] = ((L[4] ^ v) >> 23) | ((L[4] ^ v) << 41); p += 8;
-        v = pl_read64(p); L[5] = ((L[5] ^ v) >> 23) | ((L[5] ^ v) << 41); p += 8;
-        v = pl_read64(p); L[6] = ((L[6] ^ v) >> 23) | ((L[6] ^ v) << 41); p += 8;
+        v = pl_read64(p); L[0] = pl_rotr23(L[0] ^ v); p += 8;
+        v = pl_read64(p); L[1] = pl_rotr23(L[1] ^ v); p += 8;
+        v = pl_read64(p); L[2] = pl_rotr23(L[2] ^ v); p += 8;
+        v = pl_read64(p); L[3] = pl_rotr23(L[3] ^ v); p += 8;
+        v = pl_read64(p); L[4] = pl_rotr23(L[4] ^ v); p += 8;
+        v = pl_read64(p); L[5] = pl_rotr23(L[5] ^ v); p += 8;
+        v = pl_read64(p); L[6] = pl_rotr23(L[6] ^ v); p += 8;
     }
 
     /* Remaining words cyclically */
     int li = 0;
     while (p + 8 <= e) {
         uint64_t v = pl_read64(p);
-        L[li] = ((L[li] ^ v) >> 23) | ((L[li] ^ v) << 41);
+        L[li] = pl_rotr23(L[li] ^ v);
         p += 8; li = (li + 1) % 7;
     }
 
@@ -209,7 +214,7 @@ static uint64_t plums_fast(const uint8_t * PLUMS_RESTRICT p,
         if (rem >= 3) t ^= (uint64_t)p[2] << 16;
         if (rem >= 2) t ^= (uint64_t)p[1] <<  8;
         if (rem >= 1) t ^= (uint64_t)p[0];
-        L[li] = ((L[li] ^ t) >> 23) | ((L[li] ^ t) << 41);
+        L[li] = pl_rotr23(L[li] ^ t);
     }
 
     /* Compression + finaliser — rotated XOR + bit‑twiddle */
