@@ -185,11 +185,11 @@ static void wait_resp(void) {
 /* ── Command-line parsing (same text protocol as ped) ──── */
 
 static int parse_and_send(char *line) {
-    char cmd[32], path[4096];
+    char cmd[32], path[4096], path2[4096];
     size_t line_n, col_n, eline, ecol, clen;
     int eid, did;
 
-    path[0] = '\0';
+    path[0] = '\0'; path2[0] = '\0';
     line_n = col_n = eline = ecol = clen = 0;
     eid = did = 0;
 
@@ -201,11 +201,24 @@ static int parse_and_send(char *line) {
     #define NEXT() (tok = strtok(NULL, " \t\r\n"))
 
     if (!strcmp(cmd, "CACHE") || !strcmp(cmd, "GET") ||
-        !strcmp(cmd, "INFO")) {
+        !strcmp(cmd, "INFO") || !strcmp(cmd, "UNDO") ||
+        !strcmp(cmd, "BRANCH") || !strcmp(cmd, "SWITCH") ||
+        !strcmp(cmd, "DELETE_BRANCH")) {
         if (!NEXT()) return -1;
         strncpy(path, tok, sizeof(path) - 1);
+    } else if (!strcmp(cmd, "DIFF")) {
+        if (!NEXT()) return -1;
+        strncpy(path, tok, sizeof(path) - 1);
+        if (NEXT()) line_n = strtoul(tok, NULL, 10);  /* optional context */
+    } else if (!strcmp(cmd, "MERGE")) {
+        if (!NEXT()) return -1;
+        strncpy(path, tok, sizeof(path) - 1);   /* from */
+        if (!NEXT()) return -1;
+        strncpy(path2, tok, sizeof(path2) - 1);  /* to */
     } else if (!strcmp(cmd, "FLUSH") || !strcmp(cmd, "SYNC") ||
-               !strcmp(cmd, "QUIT")  || !strcmp(cmd, "KILL")) {
+               !strcmp(cmd, "QUIT")  || !strcmp(cmd, "KILL") ||
+               !strcmp(cmd, "BRANCHES") || !strcmp(cmd, "BEGIN") ||
+               !strcmp(cmd, "COMMIT") || !strcmp(cmd, "ROLLBACK")) {
         /* no args */
     } else if (!strcmp(cmd, "INSERT") || !strcmp(cmd, "REPLACE")) {
         if (!NEXT()) return -1;
@@ -244,7 +257,7 @@ static int parse_and_send(char *line) {
 
     /* Map string command to cmd_type */
     int ctype;
-    if (!strcmp(cmd, "CACHE"))   ctype = PE_CMD_CACHE;
+    if (!strcmp(cmd, "CACHE"))        ctype = PE_CMD_CACHE;
     else if (!strcmp(cmd, "INSERT"))  ctype = PE_CMD_INSERT;
     else if (!strcmp(cmd, "DELETE"))  ctype = PE_CMD_DELETE;
     else if (!strcmp(cmd, "REPLACE")) ctype = PE_CMD_REPLACE;
@@ -256,6 +269,16 @@ static int parse_and_send(char *line) {
     else if (!strcmp(cmd, "INFO"))    ctype = PE_CMD_INFO;
     else if (!strcmp(cmd, "QUIT"))    ctype = PE_CMD_QUIT;
     else if (!strcmp(cmd, "KILL"))    ctype = PE_CMD_KILL;
+    else if (!strcmp(cmd, "UNDO"))    ctype = PE_CMD_UNDO;
+    else if (!strcmp(cmd, "DIFF"))    ctype = PE_CMD_DIFF;
+    else if (!strcmp(cmd, "BRANCH"))  ctype = PE_CMD_BRANCH;
+    else if (!strcmp(cmd, "SWITCH"))  ctype = PE_CMD_SWITCH;
+    else if (!strcmp(cmd, "MERGE"))   ctype = PE_CMD_MERGE;
+    else if (!strcmp(cmd, "BRANCHES")) ctype = PE_CMD_BRANCHES;
+    else if (!strcmp(cmd, "DELETE_BRANCH")) ctype = PE_CMD_DELBR;
+    else if (!strcmp(cmd, "BEGIN"))   ctype = PE_CMD_BEGIN;
+    else if (!strcmp(cmd, "COMMIT"))  ctype = PE_CMD_COMMIT;
+    else if (!strcmp(cmd, "ROLLBACK")) ctype = PE_CMD_ROLLBACK;
     else return -1;
 
     /* Read content from stdin if needed */
@@ -281,14 +304,16 @@ static int parse_and_send(char *line) {
         .edit_id     = (uint32_t)eid,
         .dep_id      = (uint32_t)did,
         .path_len    = (uint32_t)strlen(path),
-        .content_len = (uint32_t)clen,
+        .content_len = (uint32_t)((ctype == PE_CMD_MERGE) ? strlen(path2) : clen),
         .start_line  = line_n,
         .start_col   = col_n,
         .end_line    = eline,
         .end_col     = ecol,
     };
 
-    int rc = send_cmd(&hdr, path, content ? content : "");
+    const char *content_data = content ? content : "";
+    if (ctype == PE_CMD_MERGE) content_data = path2;
+    int rc = send_cmd(&hdr, path, content_data);
     free(content);
     if (rc != 0) return -1;
 

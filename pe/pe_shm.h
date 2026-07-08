@@ -39,7 +39,17 @@ enum {
     PE_CMD_GET     = 9,
     PE_CMD_INFO    = 10,
     PE_CMD_QUIT    = 11,
-    PE_CMD_KILL    = 12
+    PE_CMD_KILL    = 12,
+    PE_CMD_UNDO    = 13,
+    PE_CMD_DIFF    = 14,
+    PE_CMD_BRANCH  = 15,
+    PE_CMD_SWITCH  = 16,
+    PE_CMD_MERGE   = 17,
+    PE_CMD_BRANCHES = 18,
+    PE_CMD_DELBR   = 19,
+    PE_CMD_BEGIN   = 20,
+    PE_CMD_COMMIT  = 21,
+    PE_CMD_ROLLBACK = 22
 };
 
 /* ── Packed command header (60 bytes) ──────────────────── */

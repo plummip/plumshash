@@ -194,6 +194,88 @@ static void process_cmd(const pe_cmd_hdr_t *hdr,
         break;
     }
 
+    case PE_CMD_UNDO: {
+        int rc = pe_undo(g_pe, path);
+        resp_write(sid, rc == 0 ? 0 : 1, rc == 0 ? "OK\n" : "ERR undo\n",
+                   rc == 0 ? 3 : 9);
+        break;
+    }
+
+    case PE_CMD_DIFF: {
+        size_t ctx = (hdr->start_line > 0) ? (size_t)hdr->start_line : 3;
+        char *d = pe_diff(g_pe, path, ctx);
+        if (!d) { resp_fmt(sid, "ERR %s\n", path); break; }
+        size_t dlen = strlen(d);
+        if (dlen == 0) {
+            resp_ok(sid, "DIFF 0\n");
+        } else {
+            char head[64];
+            int hn = snprintf(head, sizeof(head), "DIFF %zu\n", dlen);
+            size_t total = (size_t)hn + dlen;
+            char *buf = malloc(total + 1);
+            if (buf) { memcpy(buf, head, (size_t)hn); memcpy(buf + hn, d, dlen); }
+            resp_write(sid, buf ? 0 : 1, buf ? buf : "ERR oom\n",
+                       buf ? total : 9);
+            free(buf);
+        }
+        free(d);
+        break;
+    }
+
+    case PE_CMD_BRANCH:
+        resp_write(sid, pe_branch_create(g_pe, path) == 0 ? 0 : 1,
+                   "OK\n", 3);
+        break;
+
+    case PE_CMD_SWITCH:
+        resp_write(sid, pe_branch_switch(g_pe, path) == 0 ? 0 : 1,
+                   "OK\n", 3);
+        break;
+
+    case PE_CMD_MERGE: {
+        /* path = from, content = to */
+        int rc = pe_branch_merge(g_pe, path, content);
+        if (rc == 0) resp_ok(sid, "OK\n");
+        else if (rc == 1) resp_ok(sid, "CONFLICTS\n");
+        else resp_err(sid, "ERR merge\n");
+        break;
+    }
+
+    case PE_CMD_BRANCHES: {
+        char **names;
+        size_t n = pe_branch_list(g_pe, &names);
+        resp_fmt(sid, "BRANCHES %zu\n", n);
+        for (size_t i = 0; i < n; i++) {
+            const char *cur = pe_branch_current(g_pe);
+            resp_fmt(sid, "%s%s\n", names[i],
+                     strcmp(names[i], cur) == 0 ? " *" : "");
+            free(names[i]);
+        }
+        free(names);
+        break;
+    }
+
+    case PE_CMD_DELBR:
+        resp_write(sid, pe_branch_delete(g_pe, path) == 0 ? 0 : 1,
+                   "OK\n", 3);
+        break;
+
+    case PE_CMD_BEGIN:
+        resp_write(sid, pe_txn_begin(g_pe) == 0 ? 0 : 1,
+                   "OK\n", 3);
+        break;
+
+    case PE_CMD_COMMIT: {
+        size_t nf = pe_txn_commit(g_pe);
+        resp_fmt(sid, "COMMITTED %zu\n", nf);
+        break;
+    }
+
+    case PE_CMD_ROLLBACK:
+        pe_txn_rollback(g_pe);
+        resp_ok(sid, "OK\n");
+        break;
+
     case PE_CMD_QUIT:
         resp_ok(sid, "BYE\n");
         g_shm->slots[sid].in_use = 0;

@@ -456,6 +456,16 @@ static bool process_client(client_t *c) {
 /* ── Main ──────────────────────────────────────────────── */
 
 int main(int argc, char **argv) {
+    if (argc > 1 && (!strcmp(argv[1], "-h") || !strcmp(argv[1], "--help"))) {
+        printf("ped — Project Editor Daemon\n"
+               "Usage: ped [socket] [project-root]\n"
+               "  socket       Unix socket path (default: /tmp/pe.sock)\n"
+               "  project-root Project directory to edit (default: .)\n"
+               "\n"
+               "Connect with: socat - UNIX:<socket>\n"
+               "Then type HELP for command list.\n");
+        return 0;
+    }
     const char *sock = (argc > 1) ? argv[1] : "/tmp/pe.sock";
     const char *root = (argc > 2) ? argv[2] : ".";
 

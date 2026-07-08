@@ -233,7 +233,7 @@ static char *pe_mkfull(pe_t *pe, const char *rel, size_t *len) {
 }
 
 /* ═══════════════════════════════════════════════════════════
- * File I/O (disk ↔ memory)
+ * File I/O (disk → memory)
  * ═══════════════════════════════════════════════════════════ */
 
 static int file_read(pe_t *pe, const char *rel,
@@ -262,6 +262,50 @@ static int file_read(pe_t *pe, const char *rel,
     *data = buf;
     *size = (size_t)sz;
     return 0;
+}
+
+static int build_lines(char *data, size_t size,
+                       size_t **lines, size_t *nlines);
+
+/* Load a file from disk and insert into cache.  Returns the
+ * cached pe_file_t* (either new or existing).  Caller must NOT
+ * hold sched_lock. */
+static pe_file_t *file_load_or_get(pe_t *pe, const char *path) {
+    pthread_mutex_lock(&pe->sched_lock);
+    pe_file_t *f = ht_find(pe, path);
+    pthread_mutex_unlock(&pe->sched_lock);
+    if (f) return f;
+
+    f = calloc(1, sizeof(pe_file_t));
+    if (!f) return NULL;
+    f->path = strdup(path);
+    if (!f->path) { free(f); return NULL; }
+    f->path_hash = ht_hash(f->path);
+
+    if (file_read(pe, path, &f->data, &f->size) != 0)
+        { free(f->path); free(f); return NULL; }
+    if (build_lines(f->data, f->size, &f->lines, &f->nlines) != 0)
+        { free(f->data); free(f->path); free(f); return NULL; }
+
+    f->original = malloc(f->size + 1);
+    if (f->original) {
+        memcpy(f->original, f->data, f->size);
+        f->original[f->size] = '\0';
+        f->original_size = f->size;
+    }
+
+    pthread_rwlock_init(&f->lock, NULL);
+    atomic_init(&f->dirty, 0);
+
+    pthread_mutex_lock(&pe->sched_lock);
+    if (ht_insert(pe, f) != 0) {
+        pthread_rwlock_destroy(&f->lock);
+        free(f->original); free(f->lines); free(f->data); free(f->path); free(f);
+        f = ht_find(pe, path);
+        if (!f) { pthread_mutex_unlock(&pe->sched_lock); return NULL; }
+    }
+    pthread_mutex_unlock(&pe->sched_lock);
+    return f;
 }
 
 /* ═══════════════════════════════════════════════════════════
@@ -336,11 +380,20 @@ static size_t resolve_pos(pe_file_t *f, pe_pos_t pos) {
 static int apply_insert(pe_file_t *f, size_t off,
                         const char *content, size_t len) {
     if (off > f->size) return -1;
+
+    /* If content points into f->data, save offset before realloc
+       (realloc may free/move the old buffer, dangling content). */
+    ptrdiff_t content_off = -1;
+    if (content >= f->data && content < f->data + f->size)
+        content_off = content - f->data;
+
     char *nd = realloc(f->data, f->size + len + 1);
     if (!nd) return -1;
     f->data = nd;
+    if (content_off >= 0) content = f->data + content_off;
+
     memmove(f->data + off + len, f->data + off, f->size - off);
-    memcpy(f->data + off, content, len);
+    memmove(f->data + off, content, len);
     f->size += len;
     f->data[f->size] = '\0';
     atomic_store(&f->dirty, 1);
@@ -365,16 +418,23 @@ static int apply_delete(pe_file_t *f, size_t start, size_t end) {
 static int apply_replace(pe_file_t *f, size_t start, size_t end,
                          const char *content, size_t len) {
     if (start > f->size || end > f->size || start > end) return -1;
+
+    /* If content points into f->data, save offset before realloc. */
+    ptrdiff_t content_off = -1;
+    if (content >= f->data && content < f->data + f->size)
+        content_off = content - f->data;
+
     size_t oldlen = end - start;
     ssize_t delta = (ssize_t)len - (ssize_t)oldlen;
     if (delta > 0) {
         char *nd = realloc(f->data, f->size + (size_t)delta + 1);
         if (!nd) return -1;
         f->data = nd;
+        if (content_off >= 0) content = f->data + content_off;
     }
     if (delta != 0)
         memmove(f->data + start + len, f->data + end, f->size - end);
-    memcpy(f->data + start, content, len);
+    memmove(f->data + start, content, len);
     f->size = f->size - oldlen + len;
     f->data[f->size] = '\0';
     atomic_store(&f->dirty, 1);
@@ -495,8 +555,9 @@ static void apply_edit(pe_edit_t *edit) {
             struct pe_undo_s *u = &f->undo_stack[f->undo_depth++];
             u->op             = edit->op;
             u->start_off      = off_start;
-            u->end_off        = (edit->op == PE_OP_INSERT)
-                                ? off_start + edit->content_len : off_end;
+            u->end_off        = (edit->op == PE_OP_DELETE)
+                                ? off_end
+                                : off_start + edit->content_len;
             u->old_content    = old_data;
             u->old_content_len = old_len;
             old_data = NULL;  /* ownership transferred */
@@ -683,48 +744,7 @@ void pe_destroy(pe_t *pe) {
 }
 
 int pe_cache_file(pe_t *pe, const char *path) {
-    pthread_mutex_lock(&pe->sched_lock);
-    pe_file_t *f = ht_find(pe, path);
-    pthread_mutex_unlock(&pe->sched_lock);
-    if (f) return 0;  /* already cached */
-
-    /* Allocate + load (no lock — disk I/O) */
-    f = calloc(1, sizeof(pe_file_t));
-    if (!f) return -1;
-    f->path = strdup(path);
-    if (!f->path) { free(f); return -1; }
-    f->path_hash = ht_hash(f->path);
-
-    if (file_read(pe, path, &f->data, &f->size) != 0)
-        { free(f->path); free(f); return -1; }
-    if (build_lines(f->data, f->size, &f->lines, &f->nlines) != 0)
-        { free(f->data); free(f->path); free(f); return -1; }
-
-    /* Snapshot original for diff/undo */
-    f->original = malloc(f->size + 1);
-    if (f->original) {
-        memcpy(f->original, f->data, f->size);
-        f->original[f->size] = '\0';
-        f->original_size = f->size;
-    }
-
-    pthread_rwlock_init(&f->lock, NULL);
-    atomic_init(&f->dirty, 0);
-
-    /* Insert into cache (may race, which we handle) */
-    pthread_mutex_lock(&pe->sched_lock);
-    if (ht_insert(pe, f) != 0) {
-        /* Another thread beat us — discard ours, use theirs */
-        pthread_rwlock_destroy(&f->lock);
-        free(f->lines); free(f->data); free(f->path); free(f);
-        f = ht_find(pe, path);  /* must exist now */
-        if (!f) {
-            pthread_mutex_unlock(&pe->sched_lock);
-            return -1;
-        }
-    }
-    pthread_mutex_unlock(&pe->sched_lock);
-    return 0;
+    return file_load_or_get(pe, path) ? 0 : -1;
 }
 
 pe_edit_t *pe_edit_create(pe_t *pe, const char *path, pe_op_t op,
@@ -790,42 +810,8 @@ int pe_edit_depend(pe_edit_t *edit, pe_edit_t *dep) {
 
 int pe_edit_submit(pe_t *pe, pe_edit_t *edit) {
     /* ── Resolve file (load if not cached) ── */
-    pthread_mutex_lock(&pe->sched_lock);
-    pe_file_t *f = ht_find(pe, edit->path);
-    pthread_mutex_unlock(&pe->sched_lock);
-
-    if (!f) {
-        f = calloc(1, sizeof(pe_file_t));
-        if (!f) return -1;
-        f->path = strdup(edit->path);
-        if (!f->path) { free(f); return -1; }
-        f->path_hash = ht_hash(f->path);
-
-        if (file_read(pe, edit->path, &f->data, &f->size) != 0)
-            { free(f->path); free(f); return -1; }
-        if (build_lines(f->data, f->size, &f->lines, &f->nlines) != 0)
-            { free(f->data); free(f->path); free(f); return -1; }
-
-        /* Snapshot original for diff/undo */
-        f->original = malloc(f->size + 1);
-        if (f->original) {
-            memcpy(f->original, f->data, f->size);
-            f->original[f->size] = '\0';
-            f->original_size = f->size;
-        }
-
-        pthread_rwlock_init(&f->lock, NULL);
-        atomic_init(&f->dirty, 0);
-
-        pthread_mutex_lock(&pe->sched_lock);
-        if (ht_insert(pe, f) != 0) {
-            pthread_rwlock_destroy(&f->lock);
-            free(f->lines); free(f->data); free(f->path); free(f);
-            f = ht_find(pe, edit->path);
-            if (!f) { pthread_mutex_unlock(&pe->sched_lock); return -1; }
-        }
-        pthread_mutex_unlock(&pe->sched_lock);
-    }
+    pe_file_t *f = file_load_or_get(pe, edit->path);
+    if (!f) return -1;
 
     edit->file = f;
 
@@ -863,6 +849,7 @@ size_t pe_flush(pe_t *pe) {
     while (pe->pending > 0)
         pthread_cond_wait(&pe->done_cond, &pe->sched_lock);
     size_t nf = pe->nfailed;
+    pe->nfailed = 0;
     pthread_mutex_unlock(&pe->sched_lock);
     return nf;
 }
@@ -1314,12 +1301,39 @@ void pe_txn_rollback(pe_t *pe) {
         pthread_mutex_unlock(&pe->sched_lock);
         return;
     }
-    /* Free all queued edits */
-    for (size_t i = 0; i < pe->txn_nedits; i++)
-        pe_edit_free(pe->txn_edits[i]);
+    /* Collect edits and unlink from all-edits under lock */
+    size_t n = pe->txn_nedits;
+    pe_edit_t **edits = pe->txn_edits;
     pe->txn_nedits  = 0;
     pe->txn_active  = false;
+
+    /* Unlink each from all-edits while we hold sched_lock */
+    for (size_t i = 0; i < n; i++) {
+        pe_edit_t *edit = edits[i];
+        if (!edit) continue;
+        if (pe->all_edits == edit) {
+            pe->all_edits = edit->anext;
+        } else {
+            for (pe_edit_t *e = pe->all_edits; e; e = e->anext) {
+                if (e->anext == edit) {
+                    e->anext = edit->anext;
+                    break;
+                }
+            }
+        }
+    }
     pthread_mutex_unlock(&pe->sched_lock);
+
+    /* Free edits outside the lock (pe_edit_free would deadlock) */
+    for (size_t i = 0; i < n; i++) {
+        pe_edit_t *edit = edits[i];
+        if (!edit) continue;
+        free(edit->path);
+        free(edit->content);
+        free(edit->rdeps);
+        free(edit->error);
+        free(edit);
+    }
 }
 
 bool pe_txn_active(pe_t *pe) {
@@ -1344,7 +1358,7 @@ static pe_file_t *file_deep_copy(pe_file_t *src) {
     if (dst->data) { memcpy(dst->data, src->data, src->size); dst->data[src->size] = '\0'; }
     dst->original = src->original ? malloc(src->original_size + 1) : NULL;
     if (dst->original) { memcpy(dst->original, src->original, src->original_size);
-                         dst->original[dst->original_size] = '\0'; }
+                         dst->original[src->original_size] = '\0'; }
     dst->original_size = src->original_size;
     dst->nlines = src->nlines;
     dst->lines  = malloc(src->nlines * sizeof(size_t));
@@ -1444,6 +1458,7 @@ int pe_branch_switch(pe_t *pe, const char *name) {
         size_t bi = branch_find(pe, pe->current_branch);
         if (bi != SIZE_MAX) {
             branch_free_files(&pe->branches[bi]);
+            free(pe->branches[bi].name);
             memset(&pe->branches[bi], 0, sizeof(pe->branches[bi]));
             pe->branches[bi].name = strdup(pe->current_branch);
             branch_snapshot(pe, &pe->branches[bi]);
@@ -1458,6 +1473,7 @@ int pe_branch_switch(pe_t *pe, const char *name) {
         }
         if (bi != SIZE_MAX) {
             branch_free_files(&pe->branches[bi]);
+            free(pe->branches[bi].name);
             memset(&pe->branches[bi], 0, sizeof(pe->branches[bi]));
             pe->branches[bi].name = strdup("main");
             branch_snapshot(pe, &pe->branches[bi]);
@@ -1621,11 +1637,60 @@ int pe_branch_merge(pe_t *pe, const char *from, const char *to) {
         return -1;
     }
 
+    /* Save current branch state to its entry so 'from' (if it is
+       the current branch) has up-to-date file contents. */
+    if (pe->current_branch) {
+        size_t cbi = branch_find(pe, pe->current_branch);
+        if (cbi != SIZE_MAX) {
+            branch_free_files(&pe->branches[cbi]);
+            free(pe->branches[cbi].name);
+            memset(&pe->branches[cbi], 0, sizeof(pe->branches[cbi]));
+            pe->branches[cbi].name = strdup(pe->current_branch);
+            branch_snapshot(pe, &pe->branches[cbi]);
+        }
+    } else {
+        /* Implicit "main" — ensure it exists as a branch entry */
+        size_t cbi = branch_find(pe, "main");
+        if (cbi == SIZE_MAX) {
+            pe_branch_create(pe, "main");
+            cbi = branch_find(pe, "main");
+        }
+        if (cbi != SIZE_MAX) {
+            branch_free_files(&pe->branches[cbi]);
+            free(pe->branches[cbi].name);
+            memset(&pe->branches[cbi], 0, sizeof(pe->branches[cbi]));
+            pe->branches[cbi].name = strdup("main");
+            branch_snapshot(pe, &pe->branches[cbi]);
+        }
+    }
+
+    /* Swap the target branch's file table into pe->files so the
+       merge logic (which always operates on pe->files) merges
+       'from' into 'to' instead of into the current branch. */
+    struct pe_branch_s *tb = &pe->branches[ti];
+    pe_file_t **saved_files       = pe->files;
+    size_t      saved_files_cap   = pe->files_cap;
+    size_t      saved_files_count = pe->files_count;
+    pe_file_t  *saved_tombstone   = pe->tombstone;
+
+    pe->files       = tb->files;
+    pe->files_cap   = tb->files_cap;
+    pe->files_count = tb->files_count;
+    pe->tombstone   = tb->tombstone;
+
     int conflicts = 0;
 
-    /* Iterate files in 'from' branch, merge into current */
+    /* Iterate files in 'from' branch, merge into current (= target) */
     struct pe_branch_s *fb = &pe->branches[fi];
-    if (!fb->files) { pthread_mutex_unlock(&pe->sched_lock); return 0; }
+    if (!fb->files) {
+        /* Swap back before returning */
+        pe->files       = saved_files;
+        pe->files_cap   = saved_files_cap;
+        pe->files_count = saved_files_count;
+        pe->tombstone   = saved_tombstone;
+        pthread_mutex_unlock(&pe->sched_lock);
+        return 0;
+    }
     for (size_t i = 0; i < fb->files_cap; i++) {
         pe_file_t *ff = fb->files[i];
         if (!ff || ff == fb->tombstone) continue;
@@ -1701,6 +1766,17 @@ int pe_branch_merge(pe_t *pe, const char *from, const char *to) {
 
         if (fc) conflicts++;
     }
+
+    /* Swap back — update target branch's file table with merged result */
+    tb->files       = pe->files;
+    tb->files_cap   = pe->files_cap;
+    tb->files_count = pe->files_count;
+    tb->tombstone   = pe->tombstone;
+
+    pe->files       = saved_files;
+    pe->files_cap   = saved_files_cap;
+    pe->files_count = saved_files_count;
+    pe->tombstone   = saved_tombstone;
 
     pthread_mutex_unlock(&pe->sched_lock);
     return conflicts > 0 ? 1 : 0;

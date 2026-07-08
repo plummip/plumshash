@@ -157,6 +157,41 @@ int main(void) {
     assert_file_eq("main.c", expect_main, strlen(expect_main));
     assert_file_eq("util.c", expect_util, strlen(expect_util));
 
+    /* ── Transaction test ── */
+    assert(pe_txn_begin(pe) == 0);
+    pe_edit_t *t1 = pe_edit_create(pe, "main.c", PE_OP_INSERT,
+        (pe_pos_t){1, 1}, (pe_pos_t){0, 0}, "/* txn */\n", 10);
+    assert(t1);
+    assert(pe_edit_submit(pe, t1) == 0);
+    assert(pe_txn_commit(pe) == 0);
+
+    /* Rollback */
+    assert(pe_txn_begin(pe) == 0);
+    pe_edit_t *t2 = pe_edit_create(pe, "main.c", PE_OP_INSERT,
+        (pe_pos_t){1, 1}, (pe_pos_t){0, 0}, "// GONE\n", 8);
+    assert(t2);
+    assert(pe_edit_submit(pe, t2) == 0);
+    pe_txn_rollback(pe);
+    assert(!pe_txn_active(pe));
+    data = pe_file_data(pe, "main.c", &sz);
+    assert(strstr(data, "GONE") == NULL);
+
+    /* ── Undo test ── */
+    assert(pe_undo_depth(pe, "main.c") == 3);  /* e1 + e3 + t1 txn insert */
+    assert(pe_undo(pe, "main.c") == 0);         /* undo t1 (txn insert) */
+    assert(pe_undo(pe, "main.c") == 0);         /* undo e3 (replace) */
+    assert(pe_undo(pe, "main.c") == 0);         /* undo e1 (insert) */
+    assert(pe_undo_depth(pe, "main.c") == 0);
+    data = pe_file_data(pe, "main.c", &sz);
+    assert(data && strstr(data, "#include") == NULL);
+    assert(strstr(data, "return 0;") != NULL);
+
+    /* ── Diff test ── */
+    char *diff = pe_diff(pe, "main.c", 3);
+    assert(diff);
+    assert(strstr(diff, "--- a/main.c") != NULL);
+    free(diff);
+
     /* ── Cleanup ── */
     pe_destroy(pe);
     system("rm -rf " TESTDIR);
