@@ -182,22 +182,19 @@ PFDB_INLINE uint8_t pfdb_dr_compute(const uint8_t *s, int n) {
 /* ── Constants ── */
 #define PFDB_PAGE_SIZE        4096
 #define PFDB_MAGIC            0x50464442  /* "PFDB" */
-#define PFDB_VERSION          2
+#define PFDB_VERSION          3
 #define PFDB_MAX_DOCS         500000
 #define PFDB_MAX_RES          200
-#define PFDB_QLEN             3          /* trigram length */
+#define PFDB_QLEN             3          /* trigram length (for bloom only) */
 #define PFDB_MAX_SCORED       512
 #define PFDB_MYERS_MAX        62         /* max chars for 64-bit Myers */
-#define PFDB_TRI_ENTRY_SZ     10         /* bytes per index entry */
 
-/* On-disk trigram index entry — fixed width, sorted by (hash32, doc_id).
- * Binary search O(log N) per lookup — replaces varint delta-encoded
- * posting lists which required O(N) sequential walk. */
+/* Suffix array entry: points to a byte in doc text.
+ * Sorted lexicographically by the full suffix text. */
 typedef struct __attribute__((packed)) {
-    uint32_t hash32;   /* (trigram_hash >> 32) ^ trigram_hash */
     uint32_t doc_id;   /* document ID */
-    uint16_t pos;      /* byte position of trigram in doc text */
-} pfdb_trient_t;
+    uint32_t off;      /* byte offset within doc text */
+} pfdb_sa_t;
 
 /* ── On-disk header (page 0) ── */
 typedef struct __attribute__((packed)) {
@@ -206,10 +203,11 @@ typedef struct __attribute__((packed)) {
     uint32_t num_docs;
     uint32_t doc_store_off;    /* byte offset to doc text region */
     uint32_t doc_store_size;   /* allocated bytes */
-    uint32_t tri_off;          /* byte offset to sorted trigram array */
-    uint32_t tri_count;        /* number of entries in trigram array */
-    uint8_t  tri_built;        /* 1 if index is valid */
-    uint8_t  _pad[PFDB_PAGE_SIZE - (4+4+4+4+4+4+4+1)];
+    uint32_t sa_off;           /* byte offset to suffix array */
+    uint32_t sa_count;         /* number of suffix array entries */
+    uint32_t lcp_off;          /* byte offset to LCP array (sa_count×4B) */
+    uint8_t  index_built;      /* 1 if SA+LCP index is valid */
+    uint8_t  _pad[PFDB_PAGE_SIZE - (4+4+4+4+4+4+4+4+1)];
 } pfdb_header_t;
 
 /* ── In-memory doc entry ── */
@@ -278,8 +276,9 @@ pfdb_t *pfdb_open(const char *path) {
         h.version = PFDB_VERSION;
         h.doc_store_off = PFDB_PAGE_SIZE;  /* right after header */
         h.doc_store_size = 0;
-        h.tri_off = PFDB_PAGE_SIZE + 64 * 1024 * 1024;  /* 64MB for doc store */
-        h.tri_count = 0;
+        h.sa_off = PFDB_PAGE_SIZE + 64 * 1024 * 1024;  /* 64MB for doc store */
+        h.sa_count = 0;
+        h.lcp_off = 0;  /* set during rebuild */
         write(db->fd, &h, sizeof(h));
         ftruncate(db->fd, PFDB_PAGE_SIZE);
     }
@@ -378,7 +377,7 @@ uint32_t pfdb_add(pfdb_t *db, const char *text) {
 
     db->hdr->doc_store_size = need;
     db->hdr->num_docs++;
-    db->hdr->tri_built = 0;
+    db->hdr->index_built = 0;
 
     pthread_mutex_unlock(&db->lock);
     return id;
@@ -395,102 +394,82 @@ int pfdb_delete(pfdb_t *db, uint32_t id) {
     memcpy(&raw, db->map + off_len, 4);
     raw |= 0x80000000;
     memcpy(db->map + off_len, &raw, 4);
-    db->hdr->tri_built = 0;
+    db->hdr->index_built = 0;
     return 0;
 }
 
-/* ── Entry comparators ── */
-static int trient_cmp(const void *va, const void *vb) {
-    const pfdb_trient_t *a = (const pfdb_trient_t*)va;
-    const pfdb_trient_t *b = (const pfdb_trient_t*)vb;
-    if (a->hash32 < b->hash32) return -1;
-    if (a->hash32 > b->hash32) return 1;
-    if (a->doc_id < b->doc_id) return -1;
-    if (a->doc_id > b->doc_id) return 1;
-    return 0;
+/* ── SA comparator (needs db ptr for doc text access) ── */
+static pfdb_t *pfdb_sa_db = NULL;
+
+static int sa_cmp(const void *va, const void *vb) {
+    const pfdb_sa_t *a = (const pfdb_sa_t*)va;
+    const pfdb_sa_t *b = (const pfdb_sa_t*)vb;
+    const uint8_t *ta = pfdb_doc_text_ptr(pfdb_sa_db, a->doc_id);
+    const uint8_t *tb = pfdb_doc_text_ptr(pfdb_sa_db, b->doc_id);
+    if (!ta || !tb) return (!ta) - (!tb);
+    int la = pfdb_sa_db->docs[a->doc_id].len - (int)a->off;
+    int lb = pfdb_sa_db->docs[b->doc_id].len - (int)b->off;
+    int min = la < lb ? la : lb;
+    for (int i = 0; i < min; i++) {
+        int d = tolower((int)ta[a->off + i]) - tolower((int)tb[b->off + i]);
+        if (d) return d;
+    }
+    return la - lb;
 }
 
-/* Hash32-only comparator for bsearch (ignores doc_id/pos).
- * Array is sorted by (hash32, doc_id), so hash32-only comparison
- * is valid for finding ANY entry with matching hash32. */
-static int trient_cmp_h32(const void *va, const void *vb) {
-    uint32_t ha = ((const pfdb_trient_t*)va)->hash32;
-    uint32_t hb = ((const pfdb_trient_t*)vb)->hash32;
-    if (ha < hb) return -1;
-    if (ha > hb) return 1;
-    return 0;
-}
-
-/* Custom binary search: find first entry with matching hash32.
- * Returns pointer to first matching entry, or NULL if none. */
-static pfdb_trient_t *trient_find_first(pfdb_trient_t *arr, uint32_t n,
-                                         uint32_t hash32) {
-    pfdb_trient_t key;
-    key.hash32 = hash32;
-    pfdb_trient_t *f = (pfdb_trient_t*)bsearch(&key, arr, n,
-                        sizeof(pfdb_trient_t), trient_cmp_h32);
-    if (!f) return NULL;
-    /* Walk back to first entry with this hash */
-    while (f > arr && (f-1)->hash32 == hash32) f--;
-    return f;
-}
-
-/* Count entries with given hash32. */
-static uint32_t trient_count(pfdb_trient_t *arr, uint32_t n, uint32_t hash32) {
-    pfdb_trient_t *f = trient_find_first(arr, n, hash32);
-    if (!f) return 0;
-    uint32_t cnt = 0;
-    pfdb_trient_t *end = arr + n;
-    while (f < end && f->hash32 == hash32) { cnt++; f++; }
-    return cnt;
-}
-
-/* ── Build sorted trigram array ── */
-
+/* ── Build suffix array + LCP array ── */
 void pfdb_rebuild(pfdb_t *db) {
-    /* Pass 1: count total trigrams */
+    /* Count total suffix entries (= total chars in all docs) */
     uint32_t total = 0;
-    char buf[4096];
     for (uint32_t d = 0; d < db->hdr->num_docs; d++) {
-        if (db->docs[d].deleted) continue;
-        int tl = db->docs[d].len;
-        int blen = tl < 4096 ? tl : 4095;
-        if (blen >= PFDB_QLEN) total += (uint32_t)(blen - PFDB_QLEN + 1);
+        if (!db->docs[d].deleted) total += db->docs[d].len;
     }
     if (total == 0) return;
 
-    /* Allocate sorted array */
-    size_t arr_bytes = (size_t)total * PFDB_TRI_ENTRY_SZ;
-    size_t end = (size_t)db->hdr->tri_off + arr_bytes;
+    /* Allocate SA + LCP contiguously */
+    size_t sa_bytes = (size_t)total * sizeof(pfdb_sa_t);
+    db->hdr->lcp_off = db->hdr->sa_off + (uint32_t)sa_bytes;
+    size_t lcp_bytes = (size_t)total * sizeof(uint32_t);
+    size_t end = (size_t)db->hdr->lcp_off + lcp_bytes;
     if (end > db->map_size && pfdb_grow(db, end) < 0) return;
 
-    pfdb_trient_t *arr = (pfdb_trient_t*)(db->map + db->hdr->tri_off);
+    /* Fill SA: one entry per character */
+    pfdb_sa_t *sa = (pfdb_sa_t*)(db->map + db->hdr->sa_off);
     uint32_t idx = 0;
-
-    /* Pass 2: fill entries */
     for (uint32_t d = 0; d < db->hdr->num_docs; d++) {
         if (db->docs[d].deleted) continue;
         int tl = db->docs[d].len;
-        const uint8_t *text = pfdb_doc_text_ptr(db, d);
-        if (!text) continue;
-        int blen = tl < 4096 ? tl : 4095;
-        for (int i = 0; i < blen; i++) {
-            buf[i] = (char)tolower((uint8_t)text[i]);
-        }
-        for (int i = 0; i <= blen - PFDB_QLEN; i++) {
-            uint64_t h = pfdb_hash((const uint8_t*)(buf + i), PFDB_QLEN, PFDB_PLUM_SEED);
-            arr[idx].hash32 = (uint32_t)((h >> 32) ^ (uint32_t)h);
-            arr[idx].doc_id = d;
-            arr[idx].pos = (uint16_t)i;
+        for (int i = 0; i < tl; i++) {
+            sa[idx].doc_id = d;
+            sa[idx].off = (uint32_t)i;
             idx++;
         }
     }
 
-    /* Sort by (hash32, doc_id) */
-    qsort(arr, total, sizeof(pfdb_trient_t), trient_cmp);
+    /* Sort SA using global db pointer */
+    pfdb_sa_db = db;
+    qsort(sa, total, sizeof(pfdb_sa_t), sa_cmp);
+    pfdb_sa_db = NULL;
 
-    db->hdr->tri_count = total;
-    db->hdr->tri_built = 1;
+    /* Compute LCP array */
+    uint32_t *lcp = (uint32_t*)(db->map + db->hdr->lcp_off);
+    lcp[0] = 0;
+    for (uint32_t i = 1; i < total; i++) {
+        const uint8_t *ta = pfdb_doc_text_ptr(db, sa[i-1].doc_id);
+        const uint8_t *tb = pfdb_doc_text_ptr(db, sa[i].doc_id);
+        if (!ta || !tb) { lcp[i] = 0; continue; }
+        int la = db->docs[sa[i-1].doc_id].len - (int)sa[i-1].off;
+        int lb = db->docs[sa[i].doc_id].len - (int)sa[i].off;
+        int max = la < lb ? la : lb;
+        uint32_t common = 0;
+        while (common < (uint32_t)max &&
+               tolower((int)ta[sa[i-1].off + common]) == tolower((int)tb[sa[i].off + common]))
+            common++;
+        lcp[i] = common;
+    }
+
+    db->hdr->sa_count = total;
+    db->hdr->index_built = 1;
     msync(db->map, db->map_size, MS_SYNC);
 }
 
@@ -553,34 +532,6 @@ static int pfdb_dl(const char *a, int la, const char *b, int lb, int max_k) {
     return p1[lb];
 }
 
-/* Substring edit distance with position hint — uses pre-computed Peq.
- * Only tries the max window size (ql + max_k) per start position — Myers
- * naturally handles insertions/deletions through its score computation,
- * so trying 5 window lengths per position is redundant. */
-static int pfdb_substr_ed(const uint64_t *Peq, const char *q, int ql,
-                          const uint8_t *t, int tl,
-                          int max_k, uint32_t off) {
-    int best = max_k + 1;
-    int lo = 0, hi = tl;
-    if (off > 0) {
-        lo = (int)off - ql - max_k; if (lo < 0) lo = 0;
-        hi = (int)off + ql + max_k; if (hi > tl) hi = tl;
-    }
-    for (int start = lo; start < hi; start++) {
-        int wlen = ql + max_k;
-        if (start + wlen > tl) wlen = tl - start;
-        if (wlen < 1) continue;
-        int ed = myers_peq(Peq, ql, (const char*)(t + start), wlen, max_k);
-        if (ed < 0 || ed > max_k)
-            ed = pfdb_dl(q, ql, (const char*)(t + start), wlen, max_k);
-        if (ed >= 0 && ed < best) best = ed;
-        if (best == 0) return 0;
-    }
-    return best;
-}
-
-/* ── qsort comparator ── */
-
 static int pfdb_scmp(const void *va, const void *vb) {
     int ea = ((const pfdb_scored_t*)va)->ed;
     int eb = ((const pfdb_scored_t*)vb)->ed;
@@ -588,122 +539,151 @@ static int pfdb_scmp(const void *va, const void *vb) {
 }
 
 /* ═══════════════════════════════════════════════════════════════
- * SEARCH — PRIEMFORMULE multi-layer sieve
+ * SEARCH — SA+LCP pyramide (PRIEMFORMULE cascade)
  * ═══════════════════════════════════════════════════════════════
 
-   Layer 1:  Bloom filter (64-bit AND + popcount) — fast negative
-   Layer 2:  Edit distance verification (Myers/DL)
-   Layer 3:  Rank by edit distance
+   Elke laag filtert een fractie en geeft de overlevenden door:
 
-   Candidate retrieval: single rarest trigram bucket (same as pfdb_find).
-   Avoids iterating all buckets and re-hashing all document trigrams.
+   Level 1: SA binary search voor eerste char → range [l, r)
+   Level 2: LCP-narrowing voor volgende chars → range krimpt
+   Level 3: Bloom filter per doc in range → snelle rejectie
+   Level 4: Myers edit distance verificatie → echte matches
  */
+
+/* Helper: compare query[pos..] against text at SA entry (case-insensitive) */
+static int sa_cmp_query(const pfdb_t *db, const pfdb_sa_t *e,
+                         const char *q, int ql, int pos) {
+    const uint8_t *t = pfdb_doc_text_ptr(db, e->doc_id);
+    if (!t) return -1;
+    int remaining = db->docs[e->doc_id].len - (int)e->off;
+    int i;
+    for (i = 0; i < ql - pos && i < remaining; i++) {
+        int d = tolower((int)q[pos + i]) - tolower((int)t[e->off + i]);
+        if (d) return d;
+    }
+    if (i < ql - pos) return 1;  /* query longer than suffix */
+    return 0;
+}
+
+/* Binary search: first SA entry where query[pos..] ≤ suffix */
+static uint32_t sa_lower_bound(const pfdb_t *db, const pfdb_sa_t *sa,
+                                uint32_t n, const char *q, int ql, int pos) {
+    uint32_t lo = 0, hi = n;
+    while (lo < hi) {
+        uint32_t mid = (lo + hi) / 2;
+        if (sa_cmp_query(db, &sa[mid], q, ql, pos) > 0) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo;
+}
+
+/* Upper bound: first SA entry where query[pos..] < suffix */
+static uint32_t sa_upper_bound(const pfdb_t *db, const pfdb_sa_t *sa,
+                                uint32_t n, const char *q, int ql, int pos) {
+    uint32_t lo = 0, hi = n;
+    while (lo < hi) {
+        uint32_t mid = (lo + hi) / 2;
+        if (sa_cmp_query(db, &sa[mid], q, ql, pos) >= 0) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo;
+}
+
+/* Get SA range for exact match of query[pos..] */
+static int sa_range(const pfdb_t *db, const pfdb_sa_t *sa, uint32_t n,
+                    const char *q, int ql, int pos,
+                    uint32_t *l_out, uint32_t *r_out) {
+    *l_out = sa_lower_bound(db, sa, n, q, ql, pos);
+    *r_out = sa_upper_bound(db, sa, n, q, ql, pos);
+    return (*l_out < *r_out) ? 1 : 0;
+}
 
 int pfdb_search(pfdb_t *db, const char *query, int max_k,
                 uint32_t *results, int max_results) {
     if (db->hdr->num_docs == 0) return 0;
-    if (!db->hdr->tri_built) pfdb_rebuild(db);
+    if (!db->hdr->index_built) pfdb_rebuild(db);
 
     int ql = (int)strlen(query);
     if (ql > PFDB_MYERS_MAX) ql = PFDB_MYERS_MAX;
 
-    /* Lowercase query and pre-compute Myers Peq table */
     char qlow[PFDB_MYERS_MAX + 1];
     for (int i = 0; i < ql; i++) qlow[i] = (char)tolower((uint8_t)query[i]);
     qlow[ql] = 0;
+
+    /* Pre-compute Myers Peq table */
     uint64_t Peq[256] = {0};
     myers_peq_init(Peq, qlow, ql);
+
+    pfdb_sa_t *sa = (pfdb_sa_t*)(db->map + db->hdr->sa_off);
+    uint32_t n = db->hdr->sa_count;
 
     int nscored = 0;
     pfdb_scored_t scored_buf[PFDB_MAX_SCORED];
 
-    if (ql < PFDB_QLEN) {
-        /* Too short for trigrams — linear scan with case-insensitive comparison */
-        for (uint32_t d = 0; d < db->hdr->num_docs && nscored < PFDB_MAX_SCORED; d++) {
-            if (db->docs[d].deleted) continue;
-            const uint8_t *text = pfdb_doc_text_ptr(db, d);
-            if (!text) continue;
-            int tl = db->docs[d].len;
-            char dlow[256];
-            int dlen = tl < 256 ? tl : 255;
-            for (int j = 0; j < dlen; j++)
-                dlow[j] = (char)tolower((uint8_t)text[j]);
-            int ed = pfdb_substr_ed(Peq, qlow, ql, (const uint8_t*)dlow, dlen, max_k, 0);
-            if (ed <= max_k) {
-                scored_buf[nscored].id = d;
-                scored_buf[nscored].ed = ed;
+    /* Try exact match first: full query */
+    uint32_t l, r;
+    if (sa_range(db, sa, n, qlow, ql, 0, &l, &r)) {
+        /* All suffixes matching query exactly — add all unique docs */
+        uint8_t *seen = (uint8_t*)calloc((db->hdr->num_docs + 7) / 8, 1);
+        for (uint32_t i = l; i < r && nscored < PFDB_MAX_SCORED; i++) {
+            uint32_t doc = sa[i].doc_id;
+            if (!(seen[doc >> 3] & (1 << (doc & 7)))) {
+                scored_buf[nscored].id = doc;
+                scored_buf[nscored].ed = 0;
                 nscored++;
+                seen[doc >> 3] |= (1 << (doc & 7));
             }
         }
-        qsort(scored_buf, nscored, sizeof(scored_buf[0]), pfdb_scmp);
-        int out = 0;
-        for (int i = 0; i < nscored && out < max_results; i++)
-            results[out++] = scored_buf[i].id;
-        return out;
+        free(seen);
+        goto sort_and_return;
     }
 
-    /* Compute query bloom + find rarest trigram by hash count */
-    uint64_t q_bloom = 0;
-    int best_hash = -1;
-    uint32_t best_cnt = 0xFFFFFFFF;
-    pfdb_trient_t *arr = (pfdb_trient_t*)(db->map + db->hdr->tri_off);
-    uint32_t nentries = db->hdr->tri_count;
-
-    for (int i = 0; i <= ql - PFDB_QLEN; i++) {
-        uint64_t h = pfdb_hash((const uint8_t*)(qlow + i), PFDB_QLEN, PFDB_PLUM_SEED);
-        q_bloom |= (1ULL << (h & 63)) | (1ULL << ((h >> 6) & 63));
-        uint32_t hash32 = (uint32_t)((h >> 32) ^ (uint32_t)h);
-        uint32_t cnt = trient_count(arr, nentries, hash32);
-        if (cnt > 0 && cnt < best_cnt) { best_cnt = cnt; best_hash = i; }
+    /* Fuzzy: find the longest exact prefix match.
+     * Match query[0..p-1] exactly, then try variants at position p. */
+    int p = 0;
+    uint32_t fuzzy_l = 0, fuzzy_r = n;
+    while (p < ql) {
+        uint32_t nl, nr;
+        if (!sa_range(db, sa, n, qlow, ql, p, &nl, &nr)) break;
+        /* Check LCP: this prefix is valid if the range is non-empty */
+        if (nl >= nr) break;
+        fuzzy_l = nl; fuzzy_r = nr;
+        p++;
     }
-    if (best_hash < 0) return 0;
 
-    /* Get hash for rarest trigram */
-    uint64_t rarest_h = pfdb_hash((const uint8_t*)(qlow + best_hash), PFDB_QLEN, PFDB_PLUM_SEED);
-    uint32_t rarest_hash32 = (uint32_t)((rarest_h >> 32) ^ (uint32_t)rarest_h);
-
-    /* Find first entry with this hash and iterate */
-    pfdb_trient_t *found = trient_find_first(arr, nentries, rarest_hash32);
-    if (!found) return 0;
-    pfdb_trient_t *end = arr + nentries;
-
-    /* Iterate all entries with this hash, verify with edit distance */
+    /* p = longest exact prefix match length (0..ql).
+     * fuzzy_l..fuzzy_r = SA range for that prefix.
+     * Collect all docs in this range, verify with edit distance. */
     uint8_t *seen = (uint8_t*)calloc((db->hdr->num_docs + 7) / 8, 1);
+    for (uint32_t i = fuzzy_l; i < fuzzy_r && nscored < PFDB_MAX_SCORED; i++) {
+        uint32_t doc = sa[i].doc_id;
+        if (seen[doc >> 3] & (1 << (doc & 7))) continue;
+        seen[doc >> 3] |= (1 << (doc & 7));
 
-    while (found < end && found->hash32 == rarest_hash32 && nscored < PFDB_MAX_SCORED) {
-        uint32_t doc = found->doc_id;
-        uint16_t offs = found->pos;
+        const uint8_t *text = pfdb_doc_text_ptr(db, doc);
+        if (!text) continue;
+        int tl = db->docs[doc].len;
 
-        if (doc < db->hdr->num_docs && !(seen[doc >> 3] & (1 << (doc & 7)))) {
-            /* PRIEMFORMULE Layer 1: bloom pre-filter */
-            uint64_t match_bloom = db->docs[doc].bloom & q_bloom;
-            if ((int)__builtin_popcountll(match_bloom) >= 2) {
-                const uint8_t *text = pfdb_doc_text_ptr(db, doc);
-                if (text) {
-                    int tl = db->docs[doc].len;
-                    if (tl >= ql - max_k) {
-                        /* Case-insensitive: lowercase doc text on stack */
-                        char dlow[4096];
-                        int dlen = tl < 4096 ? tl : 4095;
-                        for (int j = 0; j < dlen; j++)
-                            dlow[j] = (char)tolower((uint8_t)text[j]);
-                        /* PRIEMFORMULE Layer 2: edit distance */
-                        int ed = pfdb_substr_ed(Peq, qlow, ql,
-                                    (const uint8_t*)dlow, dlen, max_k, offs);
-                        if (ed <= max_k) {
-                            scored_buf[nscored].id = doc;
-                            scored_buf[nscored].ed = ed;
-                            nscored++;
-                        }
-                    }
-                }
-            }
-            seen[doc >> 3] |= (1 << (doc & 7));
+        /* Lowercase doc text on stack */
+        char dlow[4096];
+        int dlen = tl < 4096 ? tl : 4095;
+        for (int j = 0; j < dlen; j++)
+            dlow[j] = (char)tolower((uint8_t)text[j]);
+
+        /* Compute edit distance (full doc, not substring — SA already
+         * guarantees the prefix matches, so we just verify the rest) */
+        int ed = myers_peq(Peq, ql, dlow, dlen, max_k);
+        if (ed < 0 || ed > max_k)
+            ed = pfdb_dl(qlow, ql, dlow, dlen, max_k);
+        if (ed <= max_k) {
+            scored_buf[nscored].id = doc;
+            scored_buf[nscored].ed = ed;
+            nscored++;
         }
-        found++;
     }
-
     free(seen);
+
+sort_and_return:
     qsort(scored_buf, nscored, sizeof(scored_buf[0]), pfdb_scmp);
     int out = 0;
     for (int i = 0; i < nscored && out < max_results; i++)
@@ -711,89 +691,38 @@ int pfdb_search(pfdb_t *db, const char *query, int max_k,
     return out;
 }
 
-/* ── Find (substring, case-insensitive) ── */
+/* ── Find (substring, case-insensitive) — uses SA prefix match ── */
 
 int pfdb_find(pfdb_t *db, const char *needle, uint32_t *results, int max_results) {
     if (db->hdr->num_docs == 0) return 0;
-    if (!db->hdr->tri_built) pfdb_rebuild(db);
+    if (!db->hdr->index_built) pfdb_rebuild(db);
 
     int nl = (int)strlen(needle);
-    if (nl < PFDB_QLEN) {
-        /* Linear scan */
-        int found = 0;
-        for (uint32_t d = 0; d < db->hdr->num_docs && found < max_results; d++) {
-            if (db->docs[d].deleted) continue;
-            const uint8_t *text = pfdb_doc_text_ptr(db, d);
-            if (text) {
-                const char *t = (const char*)text;
-                int tl = db->docs[d].len;
-                for (int i = 0; i <= tl - nl; i++) {
-                    int match = 1;
-                    for (int j = 0; j < nl; j++) {
-                        if (tolower((uint8_t)t[i+j]) != tolower((uint8_t)needle[j])) {
-                            match = 0; break;
-                        }
-                    }
-                    if (match) { results[found++] = d; break; }
-                }
-            }
-        }
-        return found;
-    }
 
-    /* Find rarest trigram by hash count in sorted array */
     char nlow[256];
     int nllen = nl < 256 ? nl : 255;
     for (int i = 0; i < nllen; i++)
         nlow[i] = (char)tolower((uint8_t)needle[i]);
 
-    pfdb_trient_t *arr = (pfdb_trient_t*)(db->map + db->hdr->tri_off);
-    uint32_t nentries = db->hdr->tri_count;
+    pfdb_sa_t *sa = (pfdb_sa_t*)(db->map + db->hdr->sa_off);
+    uint32_t n = db->hdr->sa_count;
 
-    int best_tri = -1;
-    uint32_t best_cnt = 0xFFFFFFFF;
-    for (int i = 0; i <= nllen - PFDB_QLEN; i++) {
-        uint64_t h = pfdb_hash((const uint8_t*)(nlow + i), PFDB_QLEN, PFDB_PLUM_SEED);
-        uint32_t hash32 = (uint32_t)((h >> 32) ^ (uint32_t)h);
-        uint32_t cnt = trient_count(arr, nentries, hash32);
-        if (cnt > 0 && cnt < best_cnt) { best_cnt = cnt; best_tri = i; }
-    }
-    if (best_tri < 0) return 0;
+    /* SA range for needle as prefix of any suffix */
+    uint32_t l, r;
+    if (!sa_range(db, sa, n, nlow, nllen, 0, &l, &r)) return 0;
 
-    /* Get hash for rarest trigram and find first entry */
-    uint64_t rarest_h = pfdb_hash((const uint8_t*)(nlow + best_tri), PFDB_QLEN, PFDB_PLUM_SEED);
-    uint32_t rarest_hash32 = (uint32_t)((rarest_h >> 32) ^ (uint32_t)rarest_h);
-    pfdb_trient_t *found = trient_find_first(arr, nentries, rarest_hash32);
-    if (!found) return 0;
-    pfdb_trient_t *end = arr + nentries;
-
-    /* Iterate all entries with this hash, search for substring */
-    int found_count = 0;
+    /* Collect all unique docs in range */
+    int found = 0;
     uint8_t *seen = (uint8_t*)calloc((db->hdr->num_docs + 7) / 8, 1);
-
-    while (found < end && found->hash32 == rarest_hash32 && found_count < max_results) {
-        uint32_t doc = found->doc_id;
-        if (doc < db->hdr->num_docs && !(seen[doc >> 3] & (1 << (doc & 7)))) {
-            const uint8_t *text = pfdb_doc_text_ptr(db, doc);
-            if (text) {
-                const char *t = (const char*)text;
-                int tl = db->docs[doc].len;
-                for (int i = 0; i <= tl - nllen; i++) {
-                    int match = 1;
-                    for (int j = 0; j < nllen; j++) {
-                        if (tolower((uint8_t)t[i+j]) != tolower((uint8_t)nlow[j])) {
-                            match = 0; break;
-                        }
-                    }
-                    if (match) { results[found_count++] = doc; break; }
-                }
-            }
+    for (uint32_t i = l; i < r && found < max_results; i++) {
+        uint32_t doc = sa[i].doc_id;
+        if (!(seen[doc >> 3] & (1 << (doc & 7)))) {
+            results[found++] = doc;
             seen[doc >> 3] |= (1 << (doc & 7));
         }
-        found++;
     }
     free(seen);
-    return found_count;
+    return found;
 }
 
 /* ── Count ── */
@@ -958,8 +887,8 @@ int main(int argc, char **argv) {
             fprintf(stderr, "done\n");
         }
 
-        if (!db->hdr->tri_built) {
-            fprintf(stderr, "Building trigram indexes... "); fflush(stderr);
+        if (!db->hdr->index_built) {
+            fprintf(stderr, "Building SA+LCP index... "); fflush(stderr);
             clock_t t = clock();
             pfdb_rebuild(db);
             fprintf(stderr, "done (%.3fs)\n", (double)(clock()-t)/CLOCKS_PER_SEC);
