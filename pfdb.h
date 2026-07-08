@@ -505,9 +505,6 @@ PFDB_HOT static void myers_peq_init(uint64_t *Peq, const char *a, int la) {
 PFDB_HOT static int myers_peq(const uint64_t *Peq, int la,
                                 const char *b, int lb, int max_k) {
     if (la > PFDB_MYERS_MAX || lb > PFDB_MYERS_MAX) return -1;
-    /* Note: caller must ensure a (query) is the pattern and b is the text.
-     * We do NOT swap here because Peq was computed from a. */
-    if (lb - la > max_k) return max_k + 1;
     uint64_t Pv = (1ULL << la) - 1, Mv = 0;
     int score = la;
     for (int j = 0; j < lb; j++) {
@@ -521,8 +518,10 @@ PFDB_HOT static int myers_peq(const uint64_t *Peq, int la,
         Ph = (Ph << 1) | 1;
         Pv = (Mh << 1) | ~(Xv | Ph);
         Mv = Ph & Xv;
-        int remaining = lb - j - 1;
-        if (score - remaining > max_k) return max_k + 1;
+        /* Note: early termination disabled for substring matching.
+         * The standard check (score - remaining > max_k) fires prematurely
+         * when la < lb because the score may still decrease after an
+         * initial increase due to length difference. */
     }
     return score;
 }
@@ -619,13 +618,17 @@ int pfdb_search(pfdb_t *db, const char *query, int max_k,
     pfdb_scored_t scored_buf[PFDB_MAX_SCORED];
 
     if (ql < PFDB_QLEN) {
-        /* Too short for trigrams — linear scan */
+        /* Too short for trigrams — linear scan with case-insensitive comparison */
         for (uint32_t d = 0; d < db->hdr->num_docs && nscored < PFDB_MAX_SCORED; d++) {
             if (db->docs[d].deleted) continue;
             const uint8_t *text = pfdb_doc_text_ptr(db, d);
             if (!text) continue;
             int tl = db->docs[d].len;
-            int ed = pfdb_substr_ed(Peq, qlow, ql, text, tl, max_k, 0);
+            char dlow[256];
+            int dlen = tl < 256 ? tl : 255;
+            for (int j = 0; j < dlen; j++)
+                dlow[j] = (char)tolower((uint8_t)text[j]);
+            int ed = pfdb_substr_ed(Peq, qlow, ql, (const uint8_t*)dlow, dlen, max_k, 0);
             if (ed <= max_k) {
                 scored_buf[nscored].id = d;
                 scored_buf[nscored].ed = ed;
@@ -679,8 +682,14 @@ int pfdb_search(pfdb_t *db, const char *query, int max_k,
                 if (text) {
                     int tl = db->docs[doc].len;
                     if (tl >= ql - max_k) {
+                        /* Case-insensitive: lowercase doc text on stack */
+                        char dlow[4096];
+                        int dlen = tl < 4096 ? tl : 4095;
+                        for (int j = 0; j < dlen; j++)
+                            dlow[j] = (char)tolower((uint8_t)text[j]);
                         /* PRIEMFORMULE Layer 2: edit distance */
-                        int ed = pfdb_substr_ed(Peq, qlow, ql, text, tl, max_k, offs);
+                        int ed = pfdb_substr_ed(Peq, qlow, ql,
+                                    (const uint8_t*)dlow, dlen, max_k, offs);
                         if (ed <= max_k) {
                             scored_buf[nscored].id = doc;
                             scored_buf[nscored].ed = ed;
