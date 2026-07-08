@@ -531,14 +531,20 @@ static int pfdb_piter_next(pfdb_piter_t *pi, uint32_t *doc, uint32_t *offs, uint
     return 1;
 }
 
-/* ── Myers bit-parallel edit distance (corrected early-termination) ── */
+/* ── Myers bit-parallel edit distance (corrected early-termination) ──
+ * Pre-compute Peq[256] from pattern (a) once, then call myers_peq for
+ * each candidate text (b). This avoids 2048 bytes of Peq setup per call. */
 
-PFDB_HOT static int pfdb_myers(const char *a, int la, const char *b, int lb, int max_k) {
-    if (la > PFDB_MYERS_MAX || lb > PFDB_MYERS_MAX) return -1;
-    if (la > lb) { const char *t = a; a = b; b = t; int tl = la; la = lb; lb = tl; }
-    if (lb - la > max_k) return max_k + 1;
-    uint64_t Peq[256] = {0};
+PFDB_HOT static void myers_peq_init(uint64_t *Peq, const char *a, int la) {
     for (int i = 0; i < la; i++) Peq[(uint8_t)a[i]] |= (1ULL << i);
+}
+
+PFDB_HOT static int myers_peq(const uint64_t *Peq, int la,
+                                const char *b, int lb, int max_k) {
+    if (la > PFDB_MYERS_MAX || lb > PFDB_MYERS_MAX) return -1;
+    /* Note: caller must ensure a (query) is the pattern and b is the text.
+     * We do NOT swap here because Peq was computed from a. */
+    if (lb - la > max_k) return max_k + 1;
     uint64_t Pv = (1ULL << la) - 1, Mv = 0;
     int score = la;
     for (int j = 0; j < lb; j++) {
@@ -585,8 +591,12 @@ static int pfdb_dl(const char *a, int la, const char *b, int lb, int max_k) {
     return p1[lb];
 }
 
-/* Substring edit distance with position hint */
-static int pfdb_substr_ed(const char *q, int ql, const uint8_t *t, int tl,
+/* Substring edit distance with position hint — uses pre-computed Peq.
+ * Only tries the max window size (ql + max_k) per start position — Myers
+ * naturally handles insertions/deletions through its score computation,
+ * so trying 5 window lengths per position is redundant. */
+static int pfdb_substr_ed(const uint64_t *Peq, const char *q, int ql,
+                          const uint8_t *t, int tl,
                           int max_k, uint32_t off) {
     int best = max_k + 1;
     int lo = 0, hi = tl;
@@ -595,15 +605,14 @@ static int pfdb_substr_ed(const char *q, int ql, const uint8_t *t, int tl,
         hi = (int)off + ql + max_k; if (hi > tl) hi = tl;
     }
     for (int start = lo; start < hi; start++) {
-        for (int wlen = ql - max_k; wlen <= ql + max_k; wlen++) {
-            if (wlen < 1) continue;
-            if (start + wlen > tl) break;
-            int ed = pfdb_myers(q, ql, (const char*)(t + start), wlen, max_k);
-            if (ed < 0 || ed > max_k)
-                ed = pfdb_dl(q, ql, (const char*)(t + start), wlen, max_k);
-            if (ed >= 0 && ed < best) best = ed;
-            if (best == 0) return 0;
-        }
+        int wlen = ql + max_k;
+        if (start + wlen > tl) wlen = tl - start;
+        if (wlen < 1) continue;
+        int ed = myers_peq(Peq, ql, (const char*)(t + start), wlen, max_k);
+        if (ed < 0 || ed > max_k)
+            ed = pfdb_dl(q, ql, (const char*)(t + start), wlen, max_k);
+        if (ed >= 0 && ed < best) best = ed;
+        if (best == 0) return 0;
     }
     return best;
 }
@@ -620,10 +629,12 @@ static int pfdb_scmp(const void *va, const void *vb) {
  * SEARCH — PRIEMFORMULE multi-layer sieve
  * ═══════════════════════════════════════════════════════════════
 
-   Layer 1:  Digital root pre-filter (per doc, not index partition)
-   Layer 2:  Bloom filter (64-bit AND + popcount) — fast negative
-   Layer 3:  Trigram intersection (two-pointer merge on bucket IDs)
-   Layer 4:  Myers/DL edit distance verification
+   Layer 1:  Bloom filter (64-bit AND + popcount) — fast negative
+   Layer 2:  Edit distance verification (Myers/DL)
+   Layer 3:  Rank by edit distance
+
+   Candidate retrieval: single rarest trigram bucket (same as pfdb_find).
+   Avoids iterating all buckets and re-hashing all document trigrams.
  */
 
 int pfdb_search(pfdb_t *db, const char *query, int max_k,
@@ -634,10 +645,12 @@ int pfdb_search(pfdb_t *db, const char *query, int max_k,
     int ql = (int)strlen(query);
     if (ql > PFDB_MYERS_MAX) ql = PFDB_MYERS_MAX;
 
-    /* Lowercase query */
+    /* Lowercase query and pre-compute Myers Peq table */
     char qlow[PFDB_MYERS_MAX + 1];
     for (int i = 0; i < ql; i++) qlow[i] = (char)tolower((uint8_t)query[i]);
     qlow[ql] = 0;
+    uint64_t Peq[256] = {0};
+    myers_peq_init(Peq, qlow, ql);
 
     int nscored = 0;
     pfdb_scored_t scored_buf[PFDB_MAX_SCORED];
@@ -649,7 +662,7 @@ int pfdb_search(pfdb_t *db, const char *query, int max_k,
             const uint8_t *text = pfdb_doc_text_ptr(db, d);
             if (!text) continue;
             int tl = db->docs[d].len;
-            int ed = pfdb_substr_ed(qlow, ql, text, tl, max_k, 0);
+            int ed = pfdb_substr_ed(Peq, qlow, ql, text, tl, max_k, 0);
             if (ed <= max_k) {
                 scored_buf[nscored].id = d;
                 scored_buf[nscored].ed = ed;
@@ -663,111 +676,58 @@ int pfdb_search(pfdb_t *db, const char *query, int max_k,
         return out;
     }
 
-    /* Compute query trigram bucket IDs and bloom filter */
-    uint32_t q_tri[PFDB_MYERS_MAX];
+    /* Compute query bloom */
     uint64_t q_bloom = 0;
-    int nqt = 0;
     for (int i = 0; i <= ql - PFDB_QLEN; i++) {
         uint64_t h = pfdb_hash((const uint8_t*)(qlow + i), PFDB_QLEN, PFDB_PLUM_SEED);
         q_bloom |= (1ULL << (h & 63)) | (1ULL << ((h >> 6) & 63));
-        q_tri[nqt++] = (uint32_t)(h % PFDB_N_BUCKETS);
     }
 
-    /* Sort + dedup query trigram buckets */
-    for (int i = 1; i < nqt; i++) {
-        uint32_t x = q_tri[i];
-        int k = i - 1;
-        while (k >= 0 && q_tri[k] > x) { q_tri[k+1] = q_tri[k]; k--; }
-        q_tri[k+1] = x;
-    }
-    { int u = 1;
-      for (int i = 1; i < nqt; i++)
-          if (q_tri[i] != q_tri[u-1]) q_tri[u++] = q_tri[i];
-      nqt = u; }
-    int min_ov = nqt - 3 * max_k;
-    if (min_ov < 1) min_ov = 1;
-
-    /* Build query fingerprint set (256 bits = 32 bytes) */
-    uint8_t q_fp_set[32] = {0};
+    /* Find rarest query trigram bucket — same as pfdb_find */
+    uint32_t q_tri_buckets[PFDB_MYERS_MAX];
+    int nqt = 0;
     for (int i = 0; i <= ql - PFDB_QLEN; i++) {
         uint64_t h = pfdb_hash((const uint8_t*)(qlow + i), PFDB_QLEN, PFDB_PLUM_SEED);
-        uint8_t fp = (uint8_t)(h >> 24);
-        q_fp_set[fp >> 3] |= (uint8_t)(1 << (fp & 7));
+        q_tri_buckets[nqt++] = (uint32_t)(h % PFDB_N_BUCKETS);
     }
 
-    /* Iterate candidates from all non-empty query trigram buckets */
+    int best_b = -1;
+    uint32_t best_sz = 0xFFFFFFFF;
+    uint32_t *dir = (uint32_t*)(db->map + db->hdr->tri_off);
+    for (int i = 0; i < nqt; i++) {
+        uint32_t b = q_tri_buckets[i];
+        uint32_t sz = (b + 1 < PFDB_N_BUCKETS ? dir[b+1] : db->hdr->tri_size) - dir[b];
+        if (sz > 0 && sz < best_sz) { best_sz = sz; best_b = (int)b; }
+    }
+    if (best_b < 0) return 0;
+
+    /* Iterate candidates from rarest bucket, verify with edit distance */
     uint8_t *seen = (uint8_t*)calloc((db->hdr->num_docs + 7) / 8, 1);
+    pfdb_piter_t pi;
+    pfdb_piter_init(&pi, db, (uint32_t)best_b);
+    uint32_t doc, offs;
+    uint8_t fp;
 
-    for (int bi = 0; bi < nqt && nscored < PFDB_MAX_SCORED; bi++) {
-        uint32_t bucket = q_tri[bi];
-        uint32_t *dir = (uint32_t*)(db->map + db->hdr->tri_off);
-        uint32_t boff = dir[bucket];
-        uint32_t bnext = (bucket + 1 < PFDB_N_BUCKETS)
-                        ? dir[bucket + 1]
-                        : db->hdr->tri_size;
-        if (bnext <= boff) continue;  /* empty bucket */
+    while (pfdb_piter_next(&pi, &doc, &offs, &fp) && nscored < PFDB_MAX_SCORED) {
+        if (doc >= db->hdr->num_docs || db->docs[doc].deleted) continue;
+        if (seen[doc >> 3] & (1 << (doc & 7))) continue;
 
-        pfdb_piter_t pi;
-        pfdb_piter_init(&pi, db, bucket);
-        uint32_t doc, offs;
-        uint8_t fp;
+        /* PRIEMFORMULE Layer 1: bloom pre-filter */
+        uint64_t match_bloom = db->docs[doc].bloom & q_bloom;
+        if ((int)__builtin_popcountll(match_bloom) < 2) continue;
 
-        while (pfdb_piter_next(&pi, &doc, &offs, &fp) && nscored < PFDB_MAX_SCORED) {
-            if (doc >= db->hdr->num_docs || db->docs[doc].deleted) continue;
-            if (seen[doc >> 3] & (1 << (doc & 7))) continue;
+        const uint8_t *text = pfdb_doc_text_ptr(db, doc);
+        if (!text) continue;
+        int tl = db->docs[doc].len;
+        if (tl < ql - max_k) continue;
 
-            /* PRIEMFORMULE Layer 2: bloom pre-filter */
-            uint64_t match_bloom = db->docs[doc].bloom & q_bloom;
-            if ((int)__builtin_popcountll(match_bloom) < min_ov * 2) continue;
-
-            const uint8_t *text = pfdb_doc_text_ptr(db, doc);
-            if (!text) continue;
-            int tl = db->docs[doc].len;
-            if (tl < ql - max_k) continue;
-
-            /* PRIEMFORMULE Layer 3: trigram intersection */
-            int tri_match = 0;
-            char dlow[4096];
-            int dlen = tl < 4096 ? tl : 4095;
-            for (int j = 0; j < dlen; j++)
-                dlow[j] = (char)tolower((uint8_t)text[j]);
-
-            uint32_t dtri[4096];
-            int ndt = 0;
-            for (int j = 0; j <= dlen - PFDB_QLEN; j++) {
-                uint64_t h = pfdb_hash((const uint8_t*)(dlow + j), PFDB_QLEN, PFDB_PLUM_SEED);
-                dtri[ndt++] = (uint32_t)(h % PFDB_N_BUCKETS);
-            }
-            /* Sort + dedup */
-            for (int i = 1; i < ndt; i++) {
-                uint32_t x = dtri[i];
-                int k = i - 1;
-                while (k >= 0 && dtri[k] > x) { dtri[k+1] = dtri[k]; k--; }
-                dtri[k+1] = x;
-            }
-            { int u = 1;
-              for (int i = 1; i < ndt; i++)
-                  if (dtri[i] != dtri[u-1]) dtri[u++] = dtri[i];
-              ndt = u; }
-
-            /* Two-pointer intersection */
-            { int qi = 0, di = 0;
-              while (qi < nqt && di < ndt) {
-                  if (q_tri[qi] < dtri[di]) qi++;
-                  else if (dtri[di] < q_tri[qi]) di++;
-                  else { tri_match++; qi++; di++; }
-              }
-            }
-            if (tri_match < min_ov) continue;
-
-            /* PRIEMFORMULE Layer 4: edit distance verification */
-            int ed = pfdb_substr_ed(qlow, ql, text, tl, max_k, offs);
-            if (ed <= max_k) {
-                scored_buf[nscored].id = doc;
-                scored_buf[nscored].ed = ed;
-                nscored++;
-                seen[doc >> 3] |= (1 << (doc & 7));
-            }
+        /* PRIEMFORMULE Layer 2: edit distance verification */
+        int ed = pfdb_substr_ed(Peq, qlow, ql, text, tl, max_k, offs);
+        if (ed <= max_k) {
+            scored_buf[nscored].id = doc;
+            scored_buf[nscored].ed = ed;
+            nscored++;
+            seen[doc >> 3] |= (1 << (doc & 7));
         }
     }
 
