@@ -276,7 +276,7 @@ pfdb_t *pfdb_open(const char *path) {
         h.version = PFDB_VERSION;
         h.doc_store_off = PFDB_PAGE_SIZE;  /* right after header */
         h.doc_store_size = 0;
-        h.sa_off = PFDB_PAGE_SIZE + 64 * 1024 * 1024;  /* 64MB for doc store */
+        h.sa_off = 0;   /* set during rebuild */
         h.sa_count = 0;
         h.lcp_off = 0;  /* set during rebuild */
         write(db->fd, &h, sizeof(h));
@@ -426,7 +426,10 @@ void pfdb_rebuild(pfdb_t *db) {
     }
     if (total == 0) return;
 
-    /* Allocate SA + LCP contiguously */
+    /* Allocate SA + LCP contiguously after doc store */
+    db->hdr->sa_off = db->hdr->doc_store_off + db->hdr->doc_store_size;
+    /* Align to 8 bytes */
+    if (db->hdr->sa_off & 7) db->hdr->sa_off = (db->hdr->sa_off + 7) & ~7U;
     size_t sa_bytes = (size_t)total * sizeof(pfdb_sa_t);
     db->hdr->lcp_off = db->hdr->sa_off + (uint32_t)sa_bytes;
     size_t lcp_bytes = (size_t)total * sizeof(uint32_t);
@@ -638,27 +641,61 @@ int pfdb_search(pfdb_t *db, const char *query, int max_k,
         goto sort_and_return;
     }
 
-    /* Fuzzy: find the longest exact prefix match.
-     * Match query[0..p-1] exactly, then try variants at position p. */
+    /* Compute query bloom */
+    uint64_t q_bloom = 0;
+    for (int i = 0; i <= ql - PFDB_QLEN && i < ql; i++) {
+        uint64_t h = pfdb_hash((const uint8_t*)(qlow + i), PFDB_QLEN, PFDB_PLUM_SEED);
+        q_bloom |= (1ULL << (h & 63)) | (1ULL << ((h >> 6) & 63));
+    }
+
+    /* Fuzzy: progressive prefix match with progressive range narrowing.
+     * Start with full SA range, narrow for each matching character. */
     int p = 0;
     uint32_t fuzzy_l = 0, fuzzy_r = n;
     while (p < ql) {
-        uint32_t nl, nr;
-        if (!sa_range(db, sa, n, qlow, ql, p, &nl, &nr)) break;
-        /* Check LCP: this prefix is valid if the range is non-empty */
+        /* Binary search within CURRENT range [fuzzy_l, fuzzy_r) instead
+         * of full array O(log(fuzzy_r-fuzzy_l)) vs O(log(n)). */
+        uint32_t nl = fuzzy_l + sa_lower_bound(db, sa + fuzzy_l, fuzzy_r - fuzzy_l,
+                                                 qlow, ql, p);
+        uint32_t nr = fuzzy_l + sa_upper_bound(db, sa + fuzzy_l, fuzzy_r - fuzzy_l,
+                                                 qlow, ql, p);
         if (nl >= nr) break;
         fuzzy_l = nl; fuzzy_r = nr;
         p++;
     }
 
-    /* p = longest exact prefix match length (0..ql).
+    /* If prefix match is short (< 3 chars), try substituting the
+     * break character — handles typo at position 0 or 1 (Flaw 1). */
+    if (p < 3 && p < ql) {
+        for (int substitute = 'a'; substitute <= 'z'; substitute++) {
+            if (substitute == (int)qlow[p]) continue;
+            char saved = qlow[p];
+            qlow[p] = (char)substitute;
+            uint32_t nl = fuzzy_l + sa_lower_bound(db, sa + fuzzy_l, fuzzy_r - fuzzy_l,
+                                                     qlow, ql, p);
+            uint32_t nr = fuzzy_l + sa_upper_bound(db, sa + fuzzy_l, fuzzy_r - fuzzy_l,
+                                                     qlow, ql, p);
+            qlow[p] = saved;
+            if (nl < nr) {
+                /* Found docs with substituted char — expand range */
+                if (nl < fuzzy_l) fuzzy_l = nl;
+                if (nr > fuzzy_r) fuzzy_r = nr;
+            }
+        }
+    }
+
+    /* p = longest exact prefix match length (possibly with substitution).
      * fuzzy_l..fuzzy_r = SA range for that prefix.
-     * Collect all docs in this range, verify with edit distance. */
+     * Collect all unique docs, verify with bloom + edit distance. */
     uint8_t *seen = (uint8_t*)calloc((db->hdr->num_docs + 7) / 8, 1);
     for (uint32_t i = fuzzy_l; i < fuzzy_r && nscored < PFDB_MAX_SCORED; i++) {
         uint32_t doc = sa[i].doc_id;
         if (seen[doc >> 3] & (1 << (doc & 7))) continue;
         seen[doc >> 3] |= (1 << (doc & 7));
+
+        /* Bloom pre-filter (Flaw 4 fix) */
+        uint64_t match = db->docs[doc].bloom & q_bloom;
+        if ((int)__builtin_popcountll(match) < 2) continue;
 
         const uint8_t *text = pfdb_doc_text_ptr(db, doc);
         if (!text) continue;
@@ -670,9 +707,15 @@ int pfdb_search(pfdb_t *db, const char *query, int max_k,
         for (int j = 0; j < dlen; j++)
             dlow[j] = (char)tolower((uint8_t)text[j]);
 
-        /* Compute edit distance (full doc, not substring — SA already
-         * guarantees the prefix matches, so we just verify the rest) */
-        int ed = myers_peq(Peq, ql, dlow, dlen, max_k);
+        /* Myers edit distance — constrained to window around matching
+         * position (sa[i].off) for efficiency (Flaw 2 fix). */
+        int win_lo = (int)sa[i].off - max_k;
+        if (win_lo < 0) win_lo = 0;
+        int win_hi = (int)sa[i].off + ql + max_k;
+        if (win_hi > dlen) win_hi = dlen;
+        int win_len = win_hi - win_lo;
+        if (win_len < 1) win_len = dlen;
+        int ed = myers_peq(Peq, ql, dlow + win_lo, win_len, max_k);
         if (ed < 0 || ed > max_k)
             ed = pfdb_dl(qlow, ql, dlow, dlen, max_k);
         if (ed <= max_k) {
