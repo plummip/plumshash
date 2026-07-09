@@ -645,49 +645,21 @@ static int pfdb_scmp(const void *va, const void *vb) {
    Level 4: Myers edit distance verificatie → echte matches
  */
 
-/* Helper: compare query[pos..pos+n-1] against text at SA entry (case-insensitive).
- * n=1 for initial character range, n=ql-pos for full prefix match. */
-static int sa_cmp_n(const pfdb_t *db, const pfdb_sa_t *e,
-                     const char *q, int ql, int pos, int n) {
-    const uint8_t *t = pfdb_doc_text_ptr(db, e->doc_id);
-    if (!t) return -1;
-    int remaining = db->docs[e->doc_id].len - (int)e->off;
-    for (int i = 0; i < n && i < remaining; i++) {
-        int d = (int)q[pos + i] - (int)t[e->off + pos + i];
-        if (d) return d;
-    }
-    if (n > remaining) return 1;  /* query prefix longer than suffix */
-    return 0;
-}
+/* Compare query[pos..ql-1] against suffix — inline in sa_cmp_query.
+ * Char-level helpers removed (no longer used after trigram-primary design). */
 
 /* Compare full remaining query: query[pos..ql-1] against suffix */
 static int sa_cmp_query(const pfdb_t *db, const pfdb_sa_t *e,
                          const char *q, int ql, int pos) {
-    return sa_cmp_n(db, e, q, ql, pos, ql - pos);
-}
-
-/* Binary search: first SA entry where query[pos] ≤ suffix[pos] (1-char) */
-static uint32_t sa_char_lower(const pfdb_t *db, const pfdb_sa_t *sa,
-                                uint32_t n, const char *q, int ql, int pos) {
-    uint32_t lo = 0, hi = n;
-    while (lo < hi) {
-        uint32_t mid = (lo + hi) / 2;
-        if (sa_cmp_n(db, &sa[mid], q, ql, pos, 1) > 0) lo = mid + 1;
-        else hi = mid;
+    const uint8_t *t = pfdb_doc_text_ptr(db, e->doc_id);
+    if (!t) return -1;
+    int remaining = db->docs[e->doc_id].len - (int)e->off;
+    for (int i = 0; i < ql - pos && i < remaining; i++) {
+        int d = (int)q[pos + i] - (int)t[e->off + pos + i];
+        if (d) return d;
     }
-    return lo;
-}
-
-/* Upper bound: first SA entry where query[pos] < suffix[pos] (1-char) */
-static uint32_t sa_char_upper(const pfdb_t *db, const pfdb_sa_t *sa,
-                                uint32_t n, const char *q, int ql, int pos) {
-    uint32_t lo = 0, hi = n;
-    while (lo < hi) {
-        uint32_t mid = (lo + hi) / 2;
-        if (sa_cmp_n(db, &sa[mid], q, ql, pos, 1) >= 0) lo = mid + 1;
-        else hi = mid;
-    }
-    return lo;
+    if (ql - pos > remaining) return 1;
+    return 0;
 }
 
 /* Binary search: first SA entry where query[pos..] ≤ suffix */
@@ -735,140 +707,53 @@ int pfdb_search(pfdb_t *db, const char *query, int max_k,
     for (int i = 0; i < ql; i++) qlow[i] = (char)tolower((uint8_t)query[i]);
     qlow[ql] = 0;
 
-    /* Pre-compute Myers Peq table */
     uint64_t Peq[256] = {0};
     myers_peq_init(Peq, qlow, ql);
 
-    /* Compute query bloom filter */
     uint64_t q_bloom = 0;
     for (int i = 0; i <= ql - PFDB_QLEN && i < ql; i++) {
         uint64_t h = pfdb_hash((const uint8_t*)(qlow + i), PFDB_QLEN, PFDB_PLUM_SEED);
         q_bloom |= (1ULL << (h & 63)) | (1ULL << ((h >> 6) & 63));
     }
 
-    pfdb_sa_t *sa = (pfdb_sa_t*)(db->map + db->hdr->sa_off);
-    uint32_t n = db->hdr->sa_count;
-
     int nscored = 0;
     pfdb_scored_t scored_buf[PFDB_MAX_SCORED];
-
-    /* Fuzzy: progressive prefix match with progressive range narrowing.
-     * Phase 1: narrow by single characters (find range for each query char).
-     * Phase 2: verify exact prefix match with full comparison. */
-    int p = 0;
-    uint32_t fuzzy_l = 0, fuzzy_r = n;
-    while (p < ql && p < 3) {
-        uint32_t nl = fuzzy_l + sa_char_lower(db, sa + fuzzy_l, fuzzy_r - fuzzy_l,
-                                                qlow, ql, p);
-        uint32_t nr = fuzzy_l + sa_char_upper(db, sa + fuzzy_l, fuzzy_r - fuzzy_l,
-                                                qlow, ql, p);
-        if (nl >= nr) break;
-        fuzzy_l = nl; fuzzy_r = nr;
-        p++;
-    }
-    /* Phase 2: full prefix match from position p (if p<3 was exact) */
-    while (p < ql && p >= 3) {
-        /* Binary search within CURRENT range [fuzzy_l, fuzzy_r) instead
-         * of full array O(log(fuzzy_r-fuzzy_l)) vs O(log(n)). */
-        uint32_t nl = fuzzy_l + sa_lower_bound(db, sa + fuzzy_l, fuzzy_r - fuzzy_l,
-                                                 qlow, ql, p);
-        uint32_t nr = fuzzy_l + sa_upper_bound(db, sa + fuzzy_l, fuzzy_r - fuzzy_l,
-                                                 qlow, ql, p);
-        if (nl >= nr) break;
-        fuzzy_l = nl; fuzzy_r = nr;
-        p++;
-    }
-
-    /* If prefix match is short (< 3 chars), try substituting the
-     * break character — handles typo at position 0 or 1 (Flaw 1). */
-    if (p < 3 && p < ql) {
-        uint32_t best_l = fuzzy_r, best_r = fuzzy_r;
-        for (int substitute = 'a'; substitute <= 'z'; substitute++) {
-            if (substitute == (int)qlow[p]) continue;
-            char saved = qlow[p];
-            qlow[p] = (char)substitute;
-            uint32_t nl = fuzzy_l + sa_char_lower(db, sa + fuzzy_l, fuzzy_r - fuzzy_l,
-                                                     qlow, ql, p);
-            uint32_t nr = fuzzy_l + sa_char_upper(db, sa + fuzzy_l, fuzzy_r - fuzzy_l,
-                                                     qlow, ql, p);
-            qlow[p] = saved;
-            if (nl < nr && (best_l >= best_r || nr - nl > best_r - best_l)) {
-                best_l = nl; best_r = nr;
-            }
-        }
-        if (best_l < best_r) { fuzzy_l = best_l; fuzzy_r = best_r; }
-    }
-
-    /* p = longest exact prefix match length (possibly with substitution).
-     * fuzzy_l..fuzzy_r = SA range for that prefix. */
     uint8_t *seen = (uint8_t*)calloc((db->hdr->num_docs + 7) / 8, 1);
 
-    /* Phase 1: SA candidates — prefix-matched docs */
-    for (uint32_t i = fuzzy_l; i < fuzzy_r && nscored < PFDB_MAX_SCORED; i++) {
-        uint32_t doc = sa[i].doc_id;
-        if (seen[doc >> 3] & (1 << (doc & 7))) continue;
-
-        const uint8_t *text = pfdb_doc_text_ptr(db, doc);
-        if (!text) continue;
-        int tl = db->docs[doc].len;
-
-        /* Quick reject: bloom filter */
-        uint64_t bloom_match = db->docs[doc].bloom & q_bloom;
-        if ((int)__builtin_popcountll(bloom_match) < 2) continue;
-
-        int win_lo = (int)sa[i].off - max_k;
-        if (win_lo < 0) win_lo = 0;
-        int win_hi = (int)sa[i].off + ql + max_k;
-        if (win_hi > tl) win_hi = tl;
-        int win_len = win_hi - win_lo;
-        if (win_len < 1) win_len = tl;
-        int ed = myers_peq(Peq, ql, (const char*)(text + win_lo), win_len, max_k);
-        if (ed < 0 || ed > max_k)
-            ed = pfdb_dl(qlow, ql, (const char*)(text + win_lo), win_len, max_k);
-        if (ed <= max_k) {
-            scored_buf[nscored].id = doc;
-            scored_buf[nscored].ed = ed;
-            nscored++;
-            seen[doc >> 3] |= (1 << (doc & 7));
-        }
-    }
-
-    /* Phase 2: trigram candidates — only if SA found nothing AND prefix short */
-    if (nscored == 0 && p < 3 && db->hdr->tri_count > 0 && ql >= PFDB_QLEN) {
+    /* Fuzzy: use trigram hash for candidates (ANY shared trigram = candidate).
+     * Much better for fuzzy than SA's prefix-only approach. */
+    if (max_k > 0 && db->hdr->tri_count > 0 && ql >= PFDB_QLEN) {
         pfdb_trient_t *tri = (pfdb_trient_t*)(db->map + db->hdr->tri_off);
+        uint32_t tri_total = db->hdr->tri_count;
         uint32_t best_cnt = 0xFFFFFFFF;
-        int best_tri = -1;
+        int best_i = -1;
         for (int i = 0; i <= ql - PFDB_QLEN; i++) {
             uint64_t h = pfdb_hash((const uint8_t*)(qlow + i), PFDB_QLEN, PFDB_PLUM_SEED);
             uint32_t hash32 = (uint32_t)((h >> 32) ^ (uint32_t)h);
-            uint32_t cnt = trient_count(tri, db->hdr->tri_count, hash32);
-            if (cnt > 0 && cnt < best_cnt) { best_cnt = cnt; best_tri = i; }
+            uint32_t cnt = trient_count(tri, tri_total, hash32);
+            if (cnt > 0 && cnt < best_cnt) { best_cnt = cnt; best_i = i; }
         }
-        if (best_tri >= 0) {
-            uint64_t h = pfdb_hash((const uint8_t*)(qlow + best_tri), PFDB_QLEN, PFDB_PLUM_SEED);
+        if (best_i >= 0) {
+            uint64_t h = pfdb_hash((const uint8_t*)(qlow + best_i), PFDB_QLEN, PFDB_PLUM_SEED);
             uint32_t hash32 = (uint32_t)((h >> 32) ^ (uint32_t)h);
-            pfdb_trient_t *found = trient_find_first(tri, db->hdr->tri_count, hash32);
+            pfdb_trient_t *found = trient_find_first(tri, tri_total, hash32);
             if (found) {
-                pfdb_trient_t *end = tri + db->hdr->tri_count;
+                pfdb_trient_t *end = tri + tri_total;
                 while (found < end && found->hash32 == hash32 && nscored < PFDB_MAX_SCORED) {
                     uint32_t doc = found->doc_id;
                     if (!(seen[doc >> 3] & (1 << (doc & 7)))) {
                         seen[doc >> 3] |= (1 << (doc & 7));
-                        /* Quick bloom reject */
-                        uint64_t bloom_match = db->docs[doc].bloom & q_bloom;
-                        if ((int)__builtin_popcountll(bloom_match) >= 2) {
+                        uint64_t bm = db->docs[doc].bloom & q_bloom;
+                        if ((int)__builtin_popcountll(bm) >= 2) {
                             const uint8_t *text = pfdb_doc_text_ptr(db, doc);
                             if (text) {
                                 int tl = db->docs[doc].len;
-                                int win_lo = (int)found->pos - max_k;
-                                if (win_lo < 0) win_lo = 0;
-                                int win_hi = (int)found->pos + ql + max_k;
-                                if (win_hi > tl) win_hi = tl;
-                                int win_len = win_hi - win_lo;
-                                if (win_len < 1) win_len = tl;
-                                int ed = myers_peq(Peq, ql, (const char*)(text + win_lo), win_len, max_k);
+                                int wl = (int)found->pos - max_k; if (wl < 0) wl = 0;
+                                int wh = (int)found->pos + ql + max_k; if (wh > tl) wh = tl;
+                                int wlen = wh - wl; if (wlen < 1) wlen = tl;
+                                int ed = myers_peq(Peq, ql, (const char*)(text + wl), wlen, max_k);
                                 if (ed < 0 || ed > max_k)
-                                    ed = pfdb_dl(qlow, ql, (const char*)(text + win_lo), win_len, max_k);
+                                    ed = pfdb_dl(qlow, ql, (const char*)(text + wl), wlen, max_k);
                                 if (ed <= max_k) {
                                     scored_buf[nscored].id = doc;
                                     scored_buf[nscored].ed = ed;
@@ -883,8 +768,43 @@ int pfdb_search(pfdb_t *db, const char *query, int max_k,
         }
     }
 
-    free(seen);
+    /* Fallback: SA prefix match (for max_k=0 or when trigram has no data) */
+    if (nscored == 0) {
+        pfdb_sa_t *sa = (pfdb_sa_t*)(db->map + db->hdr->sa_off);
+        uint32_t n = db->hdr->sa_count;
+        int p = 0;
+        uint32_t fl = 0, fr = n;
+        while (p < ql) {
+            uint32_t nl = fl + sa_lower_bound(db, sa + fl, fr - fl, qlow, ql, p);
+            uint32_t nr = fl + sa_upper_bound(db, sa + fl, fr - fl, qlow, ql, p);
+            if (nl >= nr) break;
+            fl = nl; fr = nr; p++;
+        }
+        for (uint32_t i = fl; i < fr && nscored < PFDB_MAX_SCORED; i++) {
+            uint32_t doc = sa[i].doc_id;
+            if (seen[doc >> 3] & (1 << (doc & 7))) continue;
+            const uint8_t *text = pfdb_doc_text_ptr(db, doc);
+            if (!text) continue;
+            int tl = db->docs[doc].len;
+            uint64_t bm = db->docs[doc].bloom & q_bloom;
+            if ((int)__builtin_popcountll(bm) >= 2) {
+                int wl = (int)sa[i].off - max_k; if (wl < 0) wl = 0;
+                int wh = (int)sa[i].off + ql + max_k; if (wh > tl) wh = tl;
+                int wlen = wh - wl; if (wlen < 1) wlen = tl;
+                int ed = myers_peq(Peq, ql, (const char*)(text + wl), wlen, max_k);
+                if (ed < 0 || ed > max_k)
+                    ed = pfdb_dl(qlow, ql, (const char*)(text + wl), wlen, max_k);
+                if (ed <= max_k) {
+                    scored_buf[nscored].id = doc;
+                    scored_buf[nscored].ed = ed;
+                    nscored++;
+                }
+            }
+            seen[doc >> 3] |= (1 << (doc & 7));
+        }
+    }
 
+    free(seen);
     qsort(scored_buf, nscored, sizeof(scored_buf[0]), pfdb_scmp);
     int out = 0;
     for (int i = 0; i < nscored && out < max_results; i++)
