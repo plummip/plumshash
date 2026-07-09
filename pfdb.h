@@ -650,6 +650,13 @@ int pfdb_search(pfdb_t *db, const char *query, int max_k,
     uint64_t Peq[256] = {0};
     myers_peq_init(Peq, qlow, ql);
 
+    /* Compute query bloom filter */
+    uint64_t q_bloom = 0;
+    for (int i = 0; i <= ql - PFDB_QLEN && i < ql; i++) {
+        uint64_t h = pfdb_hash((const uint8_t*)(qlow + i), PFDB_QLEN, PFDB_PLUM_SEED);
+        q_bloom |= (1ULL << (h & 63)) | (1ULL << ((h >> 6) & 63));
+    }
+
     pfdb_sa_t *sa = (pfdb_sa_t*)(db->map + db->hdr->sa_off);
     uint32_t n = db->hdr->sa_count;
 
@@ -732,6 +739,11 @@ int pfdb_search(pfdb_t *db, const char *query, int max_k,
         const uint8_t *text = pfdb_doc_text_ptr(db, doc);
         if (!text) continue;
         int tl = db->docs[doc].len;
+
+        /* Quick reject: bloom filter */
+        uint64_t bloom_match = db->docs[doc].bloom & q_bloom;
+        if ((int)__builtin_popcountll(bloom_match) < 2) continue;
+
         int win_lo = (int)sa[i].off - max_k;
         if (win_lo < 0) win_lo = 0;
         int win_hi = (int)sa[i].off + ql + max_k;
