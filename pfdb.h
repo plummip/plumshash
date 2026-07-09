@@ -720,49 +720,136 @@ int pfdb_search(pfdb_t *db, const char *query, int max_k,
     pfdb_scored_t scored_buf[PFDB_MAX_SCORED];
     uint8_t *seen = (uint8_t*)calloc((db->hdr->num_docs + 7) / 8, 1);
 
-    /* Fuzzy: use trigram hash for candidates (ANY shared trigram = candidate).
-     * Much better for fuzzy than SA's prefix-only approach. */
+    /* ── PYRAMID SEARCH ──
+     * Layer 1: Collect ALL trigram matches, accumulate per doc.
+     * Layer 2: Cluster positions → optimal window.
+     * Layer 3: Bloom + Myers verification.
+     */
     if (max_k > 0 && db->hdr->tri_count > 0 && ql >= PFDB_QLEN) {
         pfdb_trient_t *tri = (pfdb_trient_t*)(db->map + db->hdr->tri_off);
         uint32_t tri_total = db->hdr->tri_count;
-        uint32_t best_cnt = 0xFFFFFFFF;
-        int best_i = -1;
-        for (int i = 0; i <= ql - PFDB_QLEN; i++) {
+
+        /* Compute hash32 for each query trigram position */
+        uint32_t q_hash32[PFDB_MYERS_MAX];
+        int nqt = 0;
+        for (int i = 0; i <= ql - PFDB_QLEN && nqt < PFDB_MYERS_MAX; i++) {
             uint64_t h = pfdb_hash((const uint8_t*)(qlow + i), PFDB_QLEN, PFDB_PLUM_SEED);
-            uint32_t hash32 = (uint32_t)((h >> 32) ^ (uint32_t)h);
-            uint32_t cnt = trient_count(tri, tri_total, hash32);
-            if (cnt > 0 && cnt < best_cnt) { best_cnt = cnt; best_i = i; }
+            q_hash32[nqt++] = (uint32_t)((h >> 32) ^ (uint32_t)h);
         }
-        if (best_i >= 0) {
-            uint64_t h = pfdb_hash((const uint8_t*)(qlow + best_i), PFDB_QLEN, PFDB_PLUM_SEED);
-            uint32_t hash32 = (uint32_t)((h >> 32) ^ (uint32_t)h);
-            pfdb_trient_t *found = trient_find_first(tri, tri_total, hash32);
-            if (found) {
+
+        /* Layer 1: find rarest trigram → candidate doc set */
+        int best_tri = -1;
+        uint32_t best_cnt = 0xFFFFFFFF;
+        for (int i = 0; i < nqt; i++) {
+            uint32_t cnt = trient_count(tri, tri_total, q_hash32[i]);
+            if (cnt > 0 && cnt < best_cnt) { best_cnt = cnt; best_tri = i; }
+        }
+
+        if (best_tri >= 0) {
+            /* Collect ALL positions for each candidate doc.
+             * Structure: per doc, a list of (pos, trigram_index) pairs. */
+            #define PFDB_PYRA_MAXPOS 128
+            typedef struct { uint32_t doc; uint16_t pos; uint16_t tri_idx; } pfdb_pyra_entry;
+            pfdb_pyra_entry pyra_buf[PFDB_MAX_SCORED * 4];
+            int pyra_n = 0;
+            uint8_t *pyra_seen = (uint8_t*)calloc((db->hdr->num_docs + 7) / 8, 1);
+
+            /* Enter via rarest trigram */
+            pfdb_trient_t *fe = trient_find_first(tri, tri_total, q_hash32[best_tri]);
+            if (fe) {
                 pfdb_trient_t *end = tri + tri_total;
-                while (found < end && found->hash32 == hash32 && nscored < PFDB_MAX_SCORED) {
-                    uint32_t doc = found->doc_id;
-                    if (!(seen[doc >> 3] & (1 << (doc & 7)))) {
-                        seen[doc >> 3] |= (1 << (doc & 7));
-                        uint64_t bm = db->docs[doc].bloom & q_bloom;
-                        if ((int)__builtin_popcountll(bm) >= 2) {
-                            const uint8_t *text = pfdb_doc_text_ptr(db, doc);
-                            if (text) {
-                                int tl = db->docs[doc].len;
-                                int wl = (int)found->pos - max_k; if (wl < 0) wl = 0;
-                                int wh = (int)found->pos + ql + max_k; if (wh > tl) wh = tl;
-                                int wlen = wh - wl; if (wlen < 1) wlen = tl;
-                                int ed = myers_peq(Peq, ql, (const char*)(text + wl), wlen, max_k);
-                                if (ed < 0 || ed > max_k)
-                                    ed = pfdb_dl(qlow, ql, (const char*)(text + wl), wlen, max_k);
-                                if (ed <= max_k) {
-                                    scored_buf[nscored].id = doc;
-                                    scored_buf[nscored].ed = ed;
-                                    nscored++;
-                                }
+                while (fe < end && fe->hash32 == q_hash32[best_tri]) {
+                    uint32_t doc = fe->doc_id;
+                    if (!(pyra_seen[doc >> 3] & (1 << (doc & 7))) && pyra_n < PFDB_MAX_SCORED * 4) {
+                        pyra_seen[doc >> 3] |= (1 << (doc & 7));
+                        pyra_buf[pyra_n].doc = doc;
+                        pyra_buf[pyra_n].pos = fe->pos;
+                        pyra_buf[pyra_n].tri_idx = (uint16_t)best_tri;
+                        pyra_n++;
+                    } else if (pyra_n < PFDB_MAX_SCORED * 4) {
+                        /* Already seen: add another position for this doc */
+                        pyra_buf[pyra_n].doc = doc;
+                        pyra_buf[pyra_n].pos = fe->pos;
+                        pyra_buf[pyra_n].tri_idx = (uint16_t)best_tri;
+                        pyra_n++;
+                    }
+                    fe++;
+                }
+
+                /* Layer 2: for each candidate doc, query OTHER trigrams too */
+                for (int ti = 0; ti < nqt && pyra_n < PFDB_MAX_SCORED * 4; ti++) {
+                    if (ti == best_tri) continue;
+                    pfdb_trient_t *fe2 = trient_find_first(tri, tri_total, q_hash32[ti]);
+                    if (!fe2) continue;
+                    pfdb_trient_t *end2 = tri + tri_total;
+                    while (fe2 < end2 && fe2->hash32 == q_hash32[ti]) {
+                        uint32_t doc = fe2->doc_id;
+                        if (pyra_seen[doc >> 3] & (1 << (doc & 7))) {
+                            pyra_buf[pyra_n].doc = doc;
+                            pyra_buf[pyra_n].pos = fe2->pos;
+                            pyra_buf[pyra_n].tri_idx = (uint16_t)ti;
+                            pyra_n++;
+                        }
+                        fe2++;
+                    }
+                }
+            }
+            free(pyra_seen);
+
+            /* Layer 3: merge positions per doc, cluster → optimal window, verify */
+            if (pyra_n > 0) {
+                /* Sort by (doc, pos) for easy merging */
+                for (int i = 1; i < pyra_n; i++) {
+                    pfdb_pyra_entry tmp = pyra_buf[i];
+                    int j = i - 1;
+                    while (j >= 0 && (pyra_buf[j].doc > tmp.doc ||
+                           (pyra_buf[j].doc == tmp.doc && pyra_buf[j].pos > tmp.pos))) {
+                        pyra_buf[j+1] = pyra_buf[j]; j--;
+                    }
+                    pyra_buf[j+1] = tmp;
+                }
+
+                /* Merge per doc: find min/max position, compute trigram density */
+                int i = 0;
+                while (i < pyra_n && nscored < PFDB_MAX_SCORED) {
+                    uint32_t doc = pyra_buf[i].doc;
+                    uint16_t min_pos = pyra_buf[i].pos;
+                    uint16_t max_pos = pyra_buf[i].pos;
+                    uint64_t tri_mask = 0;
+                    int j = i;
+                    while (j < pyra_n && pyra_buf[j].doc == doc) {
+                        if (pyra_buf[j].pos < min_pos) min_pos = pyra_buf[j].pos;
+                        if (pyra_buf[j].pos > max_pos) max_pos = pyra_buf[j].pos;
+                        tri_mask |= (1ULL << pyra_buf[j].tri_idx);
+                        j++;
+                    }
+                    (void)tri_mask;
+
+                    /* Bloom filter */
+                    uint64_t bm = db->docs[doc].bloom & q_bloom;
+                    if ((int)__builtin_popcountll(bm) >= 2) {
+                        const uint8_t *text = pfdb_doc_text_ptr(db, doc);
+                        if (text) {
+                            int tl = db->docs[doc].len;
+                            /* Optimal window from CLUSTERED positions */
+                            int cluster_center = ((int)min_pos + (int)max_pos) / 2;
+                            int wl = cluster_center - max_k;
+                            if (wl < 0) wl = 0;
+                            int wh = cluster_center + ql + max_k;
+                            if (wh > tl) wh = tl;
+                            int wlen = wh - wl;
+                            if (wlen < 1) wlen = tl;
+                            int ed = myers_peq(Peq, ql, (const char*)(text + wl), wlen, max_k);
+                            if (ed < 0 || ed > max_k)
+                                ed = pfdb_dl(qlow, ql, (const char*)(text + wl), wlen, max_k);
+                            if (ed <= max_k) {
+                                scored_buf[nscored].id = doc;
+                                scored_buf[nscored].ed = ed;
+                                nscored++;
                             }
                         }
                     }
-                    found++;
+                    i = j;
                 }
             }
         }
