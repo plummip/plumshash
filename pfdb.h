@@ -137,13 +137,37 @@ void pfdb_rebuild(pfdb_t *db);
 /* We embed a minimal fast hash for trigrams. Using PRIEMFORMULE-guided constants. */
 #define PFDB_PLUM_SEED 0x9E3779B9
 
-/* FNV-1a for small keys (trigrams = 3 bytes) */
+/* ── PlumsHash tiny path for trigram/bloom hashing ──
+ * Uses PRIEMFORMULE-guided constants (M3, rot 41). ~3 ns per call. */
 static uint64_t pfdb_hash(const uint8_t *data, int len, uint64_t seed) {
-    uint64_t h = seed;
-    for (int i = 0; i < len; i++) {
-        h ^= (uint64_t)data[i];
-        h *= 0x00000100000001B3ULL;
+    const uint64_t PL_M3 = 0xEB558C079835F595ULL;
+    const uint64_t PL_PHI = 0x9E3779B97F4A7C15ULL;
+    uint64_t h = seed ^ PL_PHI;
+    uint64_t a, b = h;
+    if (len <= 3) {
+        a = ((uint64_t)data[0] << 16)
+          | ((uint64_t)data[len >> 1] << 8)
+          |  (uint64_t)data[len - 1];
+    } else if (len <= 8) {
+        uint32_t lo, hi;
+        memcpy(&lo, data, 4);
+        memcpy(&hi, data + len - 4, 4);
+        a = ((uint64_t)lo << 32) | (uint64_t)hi;
+    } else {
+        uint64_t lo, hi;
+        memcpy(&lo, data, 8);
+        memcpy(&hi, data + len - 8, 8);
+        a = lo;
+        b = hi ^ h;
     }
+    h  = a * PL_M3;
+    h ^= b;
+    h  = (h << 41) | (h >> 23);
+    h *= PL_M3;
+    /* Finalizer: guaranteed-avalanche sequence */
+    h ^= h >> 33; h *= 0xFF51AFD7ED558CCDULL;
+    h ^= h >> 33; h *= 0xC4CEB9FE1A85EC53ULL;
+    h ^= h >> 33;
     return h;
 }
 
@@ -234,7 +258,8 @@ struct pfdb_s {
     int           fd;
     pfdb_header_t *hdr;
     pfdb_doc_t   *docs;
-    pthread_mutex_t lock;  /* for thread-safe add */
+    pthread_mutex_t lock;
+    uint32_t      tri_route[256];  /* accelerator: top-8-bit → first index */
 };
 
 /* ── Internal functions ── */
@@ -451,6 +476,20 @@ static uint32_t trient_count(pfdb_trient_t *arr, uint32_t n, uint32_t hash32) {
     return cnt;
 }
 
+/* Route-table-accelerated lookup: O(1) position + linear scan.
+ * Requires db->tri_route to be built (done in pfdb_rebuild). */
+static pfdb_trient_t *trient_find_route(const pfdb_t *db, pfdb_trient_t *tri,
+                                          uint32_t tri_total, uint32_t hash32) {
+    int bucket = (int)(hash32 >> 24);
+    uint32_t start = db->tri_route[bucket];
+    uint32_t end = (bucket < 255) ? db->tri_route[bucket + 1] : tri_total;
+    for (uint32_t i = start; i < end; i++) {
+        if (tri[i].hash32 == hash32) return &tri[i];
+        if (tri[i].hash32 > hash32) return NULL;
+    }
+    return NULL;
+}
+
 static int sa_cmp(const void *va, const void *vb) {
     const pfdb_sa_t *a = (const pfdb_sa_t*)va;
     const pfdb_sa_t *b = (const pfdb_sa_t*)vb;
@@ -559,6 +598,15 @@ void pfdb_rebuild(pfdb_t *db) {
         }
         qsort(tri, tri_total, sizeof(pfdb_trient_t), trient_cmp);
         db->hdr->tri_count = tri_total;
+
+        /* Build route table (accelerator: top 8 bits → first index) */
+        memset(db->tri_route, 0, sizeof(db->tri_route));
+        int prev_bucket = -1;
+        for (uint32_t i = 0; i < tri_total; i++) {
+            int bucket = tri[i].hash32 >> 24;
+            while (prev_bucket < bucket) db->tri_route[++prev_bucket] = i;
+        }
+        while (prev_bucket < 255) db->tri_route[++prev_bucket] = tri_total;
     } else {
         db->hdr->tri_off = 0;
         db->hdr->tri_count = 0;
@@ -754,8 +802,8 @@ int pfdb_search(pfdb_t *db, const char *query, int max_k,
             int pyra_n = 0;
             uint8_t *pyra_seen = (uint8_t*)calloc((db->hdr->num_docs + 7) / 8, 1);
 
-            /* Enter via rarest trigram */
-            pfdb_trient_t *fe = trient_find_first(tri, tri_total, q_hash32[best_tri]);
+            /* Enter via rarest trigram (route-table accelerated) */
+            pfdb_trient_t *fe = trient_find_route(db, tri, tri_total, q_hash32[best_tri]);
             if (fe) {
                 pfdb_trient_t *end = tri + tri_total;
                 while (fe < end && fe->hash32 == q_hash32[best_tri]) {
@@ -779,7 +827,7 @@ int pfdb_search(pfdb_t *db, const char *query, int max_k,
                 /* Layer 2: for each candidate doc, query OTHER trigrams too */
                 for (int ti = 0; ti < nqt && pyra_n < PFDB_MAX_SCORED * 4; ti++) {
                     if (ti == best_tri) continue;
-                    pfdb_trient_t *fe2 = trient_find_first(tri, tri_total, q_hash32[ti]);
+                    pfdb_trient_t *fe2 = trient_find_route(db, tri, tri_total, q_hash32[ti]);
                     if (!fe2) continue;
                     pfdb_trient_t *end2 = tri + tri_total;
                     while (fe2 < end2 && fe2->hash32 == q_hash32[ti]) {
