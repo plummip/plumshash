@@ -206,8 +206,10 @@ typedef struct __attribute__((packed)) {
     uint32_t sa_off;           /* byte offset to suffix array */
     uint32_t sa_count;         /* number of suffix array entries */
     uint32_t lcp_off;          /* byte offset to LCP array (sa_count×4B) */
-    uint8_t  index_built;      /* 1 if SA+LCP index is valid */
-    uint8_t  _pad[PFDB_PAGE_SIZE - (4+4+4+4+4+4+4+4+1)];
+    uint32_t tri_off;          /* byte offset to trigram array */
+    uint32_t tri_count;        /* number of trigram entries */
+    uint8_t  index_built;      /* 1 if index is valid */
+    uint8_t  _pad[PFDB_PAGE_SIZE - (4+4+4+4+4+4+4+4+4+4+1)];
 } pfdb_header_t;
 
 /* ── In-memory doc entry ── */
@@ -279,6 +281,8 @@ pfdb_t *pfdb_open(const char *path) {
         h.sa_off = 0;   /* set during rebuild */
         h.sa_count = 0;
         h.lcp_off = 0;  /* set during rebuild */
+        h.tri_off = 0;  /* set during rebuild */
+        h.tri_count = 0;
         write(db->fd, &h, sizeof(h));
         ftruncate(db->fd, PFDB_PAGE_SIZE);
     }
@@ -404,6 +408,49 @@ int pfdb_delete(pfdb_t *db, uint32_t id) {
 /* ── SA comparator (needs db ptr for doc text access) ── */
 static pfdb_t *pfdb_sa_db = NULL;
 
+/* ── Trigram index entry (supplementary index for fuzzy search) ── */
+typedef struct __attribute__((packed)) {
+    uint32_t hash32;
+    uint32_t doc_id;
+    uint16_t pos;
+} pfdb_trient_t;
+
+static int trient_cmp(const void *va, const void *vb) {
+    const pfdb_trient_t *a = (const pfdb_trient_t*)va;
+    const pfdb_trient_t *b = (const pfdb_trient_t*)vb;
+    if (a->hash32 < b->hash32) return -1;
+    if (a->hash32 > b->hash32) return 1;
+    if (a->doc_id < b->doc_id) return -1;
+    if (a->doc_id > b->doc_id) return 1;
+    return 0;
+}
+
+static int trient_cmp_h32(const void *va, const void *vb) {
+    uint32_t ha = ((const pfdb_trient_t*)va)->hash32;
+    uint32_t hb = ((const pfdb_trient_t*)vb)->hash32;
+    if (ha < hb) return -1;
+    if (ha > hb) return 1;
+    return 0;
+}
+
+static pfdb_trient_t *trient_find_first(pfdb_trient_t *arr, uint32_t n, uint32_t hash32) {
+    pfdb_trient_t key;
+    key.hash32 = hash32;
+    pfdb_trient_t *f = (pfdb_trient_t*)bsearch(&key, arr, n, sizeof(pfdb_trient_t), trient_cmp_h32);
+    if (!f) return NULL;
+    while (f > arr && (f-1)->hash32 == hash32) f--;
+    return f;
+}
+
+static uint32_t trient_count(pfdb_trient_t *arr, uint32_t n, uint32_t hash32) {
+    pfdb_trient_t *f = trient_find_first(arr, n, hash32);
+    if (!f) return 0;
+    uint32_t cnt = 0;
+    pfdb_trient_t *end = arr + n;
+    while (f < end && f->hash32 == hash32) { cnt++; f++; }
+    return cnt;
+}
+
 static int sa_cmp(const void *va, const void *vb) {
     const pfdb_sa_t *a = (const pfdb_sa_t*)va;
     const pfdb_sa_t *b = (const pfdb_sa_t*)vb;
@@ -475,6 +522,48 @@ void pfdb_rebuild(pfdb_t *db) {
     }
 
     db->hdr->sa_count = total;
+
+    /* Build supplementary trigram hash index (after SA+LCP) */
+    uint32_t tri_total = 0;
+    char buf[4096];
+    for (uint32_t d = 0; d < db->hdr->num_docs; d++) {
+        if (db->docs[d].deleted) continue;
+        int tl = db->docs[d].len;
+        int blen = tl < 4096 ? tl : 4095;
+        if (blen >= PFDB_QLEN) tri_total += (uint32_t)(blen - PFDB_QLEN + 1);
+    }
+    if (tri_total > 0) {
+        db->hdr->tri_off = db->hdr->lcp_off + (uint32_t)((size_t)total * sizeof(uint32_t));
+        if (db->hdr->tri_off & 7) db->hdr->tri_off = (db->hdr->tri_off + 7) & ~7U;
+        size_t tri_bytes = (size_t)tri_total * sizeof(pfdb_trient_t);
+        size_t tri_end = (size_t)db->hdr->tri_off + tri_bytes;
+        if (tri_end > db->map_size && pfdb_grow(db, tri_end) < 0) return;
+
+        pfdb_trient_t *tri = (pfdb_trient_t*)(db->map + db->hdr->tri_off);
+        uint32_t tri_idx = 0;
+        for (uint32_t d = 0; d < db->hdr->num_docs; d++) {
+            if (db->docs[d].deleted) continue;
+            int tl = db->docs[d].len;
+            const uint8_t *text = pfdb_doc_text_ptr(db, d);
+            if (!text) continue;
+            int blen = tl < 4096 ? tl : 4095;
+            for (int i = 0; i < blen; i++)
+                buf[i] = (char)tolower((uint8_t)text[i]);
+            for (int i = 0; i <= blen - PFDB_QLEN; i++) {
+                uint64_t h = pfdb_hash((const uint8_t*)(buf + i), PFDB_QLEN, PFDB_PLUM_SEED);
+                tri[tri_idx].hash32 = (uint32_t)((h >> 32) ^ (uint32_t)h);
+                tri[tri_idx].doc_id = d;
+                tri[tri_idx].pos = (uint16_t)i;
+                tri_idx++;
+            }
+        }
+        qsort(tri, tri_total, sizeof(pfdb_trient_t), trient_cmp);
+        db->hdr->tri_count = tri_total;
+    } else {
+        db->hdr->tri_off = 0;
+        db->hdr->tri_count = 0;
+    }
+
     db->hdr->index_built = 1;
     msync(db->map, db->map_size, MS_SYNC);
 }
@@ -663,24 +752,6 @@ int pfdb_search(pfdb_t *db, const char *query, int max_k,
     int nscored = 0;
     pfdb_scored_t scored_buf[PFDB_MAX_SCORED];
 
-    /* Try exact match first: full query */
-    uint32_t l, r;
-    if (sa_range(db, sa, n, qlow, ql, 0, &l, &r)) {
-        /* All suffixes matching query exactly — add all unique docs */
-        uint8_t *seen = (uint8_t*)calloc((db->hdr->num_docs + 7) / 8, 1);
-        for (uint32_t i = l; i < r && nscored < PFDB_MAX_SCORED; i++) {
-            uint32_t doc = sa[i].doc_id;
-            if (!(seen[doc >> 3] & (1 << (doc & 7)))) {
-                scored_buf[nscored].id = doc;
-                scored_buf[nscored].ed = 0;
-                nscored++;
-                seen[doc >> 3] |= (1 << (doc & 7));
-            }
-        }
-        free(seen);
-        goto sort_and_return;
-    }
-
     /* Fuzzy: progressive prefix match with progressive range narrowing.
      * Phase 1: narrow by single characters (find range for each query char).
      * Phase 2: verify exact prefix match with full comparison. */
@@ -729,9 +800,10 @@ int pfdb_search(pfdb_t *db, const char *query, int max_k,
     }
 
     /* p = longest exact prefix match length (possibly with substitution).
-     * fuzzy_l..fuzzy_r = SA range for that prefix.
-     * Collect all unique docs, verify with bloom + edit distance. */
+     * fuzzy_l..fuzzy_r = SA range for that prefix. */
     uint8_t *seen = (uint8_t*)calloc((db->hdr->num_docs + 7) / 8, 1);
+
+    /* Phase 1: SA candidates — prefix-matched docs */
     for (uint32_t i = fuzzy_l; i < fuzzy_r && nscored < PFDB_MAX_SCORED; i++) {
         uint32_t doc = sa[i].doc_id;
         if (seen[doc >> 3] & (1 << (doc & 7))) continue;
@@ -760,9 +832,59 @@ int pfdb_search(pfdb_t *db, const char *query, int max_k,
             seen[doc >> 3] |= (1 << (doc & 7));
         }
     }
+
+    /* Phase 2: trigram candidates — only if SA found nothing AND prefix short */
+    if (nscored == 0 && p < 3 && db->hdr->tri_count > 0 && ql >= PFDB_QLEN) {
+        pfdb_trient_t *tri = (pfdb_trient_t*)(db->map + db->hdr->tri_off);
+        uint32_t best_cnt = 0xFFFFFFFF;
+        int best_tri = -1;
+        for (int i = 0; i <= ql - PFDB_QLEN; i++) {
+            uint64_t h = pfdb_hash((const uint8_t*)(qlow + i), PFDB_QLEN, PFDB_PLUM_SEED);
+            uint32_t hash32 = (uint32_t)((h >> 32) ^ (uint32_t)h);
+            uint32_t cnt = trient_count(tri, db->hdr->tri_count, hash32);
+            if (cnt > 0 && cnt < best_cnt) { best_cnt = cnt; best_tri = i; }
+        }
+        if (best_tri >= 0) {
+            uint64_t h = pfdb_hash((const uint8_t*)(qlow + best_tri), PFDB_QLEN, PFDB_PLUM_SEED);
+            uint32_t hash32 = (uint32_t)((h >> 32) ^ (uint32_t)h);
+            pfdb_trient_t *found = trient_find_first(tri, db->hdr->tri_count, hash32);
+            if (found) {
+                pfdb_trient_t *end = tri + db->hdr->tri_count;
+                while (found < end && found->hash32 == hash32 && nscored < PFDB_MAX_SCORED) {
+                    uint32_t doc = found->doc_id;
+                    if (!(seen[doc >> 3] & (1 << (doc & 7)))) {
+                        seen[doc >> 3] |= (1 << (doc & 7));
+                        /* Quick bloom reject */
+                        uint64_t bloom_match = db->docs[doc].bloom & q_bloom;
+                        if ((int)__builtin_popcountll(bloom_match) >= 2) {
+                            const uint8_t *text = pfdb_doc_text_ptr(db, doc);
+                            if (text) {
+                                int tl = db->docs[doc].len;
+                                int win_lo = (int)found->pos - max_k;
+                                if (win_lo < 0) win_lo = 0;
+                                int win_hi = (int)found->pos + ql + max_k;
+                                if (win_hi > tl) win_hi = tl;
+                                int win_len = win_hi - win_lo;
+                                if (win_len < 1) win_len = tl;
+                                int ed = myers_peq(Peq, ql, (const char*)(text + win_lo), win_len, max_k);
+                                if (ed < 0 || ed > max_k)
+                                    ed = pfdb_dl(qlow, ql, (const char*)(text + win_lo), win_len, max_k);
+                                if (ed <= max_k) {
+                                    scored_buf[nscored].id = doc;
+                                    scored_buf[nscored].ed = ed;
+                                    nscored++;
+                                }
+                            }
+                        }
+                    }
+                    found++;
+                }
+            }
+        }
+    }
+
     free(seen);
 
-sort_and_return:
     qsort(scored_buf, nscored, sizeof(scored_buf[0]), pfdb_scmp);
     int out = 0;
     for (int i = 0; i < nscored && out < max_results; i++)
