@@ -170,7 +170,8 @@ static PLUMS_INLINE uint64_t plums_tiny(const uint8_t * PLUMS_RESTRICT p,
  *
  * 7 independent lanes, 56 bytes per iteration, rotr(x,23) mixer.
  * BITSCAN-verified: 39.1% avalanche, 15+ GB/s at 4KB on aarch64.
- * Faster than the original 4‑lane ARX chain with same quality.
+ * Prefetch 512B ahead to overlap DRAM latency with ALU work.
+ * At 4KB the CPU otherwise stalls on every cache-line miss.
  */
 static PLUMS_INLINE uint64_t plums_fast(const uint8_t * PLUMS_RESTRICT p,
                            size_t len, uint64_t seed) {
@@ -187,8 +188,9 @@ static PLUMS_INLINE uint64_t plums_fast(const uint8_t * PLUMS_RESTRICT p,
     }
     L[0] ^= len;
 
-    /* 7-lane: 56 bytes per iteration */
+    /* 7-lane: 56 bytes per iteration, prefetch 512B ahead */
     while (PLUMS_LIKELY(p + 56 <= e)) {
+        __builtin_prefetch(p + 512, 0, 3);  /* read, high temporal locality */
         uint64_t v;
         v = pl_read64(p); L[0] = ((L[0] ^ v) >> 23) | ((L[0] ^ v) << 41); p += 8;
         v = pl_read64(p); L[1] = ((L[1] ^ v) >> 23) | ((L[1] ^ v) << 41); p += 8;
