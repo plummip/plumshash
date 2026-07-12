@@ -120,14 +120,15 @@ static PLUMS_INLINE uint64_t plums_final(uint64_t h) {
  * ── Tiny path (len ≤ 16): lightweight multiply-mix ──
  *
  * Avoids the four ARX lanes and accumulator setup of the safe path.
- * For len ≤ 8 a single qword is read; for 9–16 two overlapping qwords
- * are mixed.  The seed and length are folded in before mixing so that
- * different lengths and appended zeroes produce different hashes.
+ * Optimised fast paths for the most common key sizes in hash-table
+ * workloads (4‑byte int, 8‑byte float, 1‑byte bool) eliminate
+ * redundant loads: a single read + broadcast/reinterpret replaces
+ * the generic two‑read overlapping pattern.
  */
 static PLUMS_INLINE uint64_t plums_tiny(const uint8_t * PLUMS_RESTRICT p,
                                         size_t len, uint64_t seed) {
     uint64_t h = seed ^ (len * PL_PHI);
-    uint64_t a, b = h;
+    uint64_t a;
 
     if (PLUMS_UNLIKELY(len == 0))
         return plums_final(h);
@@ -137,20 +138,28 @@ static PLUMS_INLINE uint64_t plums_tiny(const uint8_t * PLUMS_RESTRICT p,
         a = ((uint64_t)p[0]      << 16)
           | ((uint64_t)p[len >> 1] << 8)
           |  (uint64_t)p[len - 1];
-    } else if (len <= 8) {
-        /* 4–8 bytes: two overlapping/aligned 32-bit reads */
+    } else if (len == 4) {
+        /* 4‑byte int: single read + broadcast (no redundant second load) */
+        uint32_t v = pl_read32(p);
+        a = (uint64_t)v * 0x100000001ULL;   /* broadcast: v | (v << 32) */
+    } else if (len == 8) {
+        /* 8‑byte float: single 64‑bit read, swap halves to match
+         * original (first4 << 32 | last4) behaviour */
+        a = pl_read64(p);
+        a = (a << 32) | (a >> 32);
+    } else if (len < 8) {
+        /* 5–7 bytes: first 4 + overlapping last 4 */
         uint32_t lo = pl_read32(p);
         uint32_t hi = pl_read32(p + len - 4);
         a = ((uint64_t)lo << 32) | (uint64_t)hi;
     } else { /* 9–16 bytes */
         a = pl_read64(p);
-        b = pl_read64(p + len - 8) ^ h;   /* last 8 bytes, may overlap a */
+        h ^= pl_read64(p + len - 8);   /* tail 8 bytes folded into h */
     }
 
     /* Multiply/rotate constants selected by scanning 4×4×63 combos for
      * lowest χ² on 4‑byte keys (M3/41/M3 beats M1/51/PHI, 196.0 vs 217.9). */
-    h  = a * PL_M3;
-    h ^= b;
+    h ^= a * PL_M3;
     h  = pl_rot(h, 41);
     h *= PL_M3;
     return plums_final(h);
@@ -163,7 +172,7 @@ static PLUMS_INLINE uint64_t plums_tiny(const uint8_t * PLUMS_RESTRICT p,
  * BITSCAN-verified: 39.1% avalanche, 15+ GB/s at 4KB on aarch64.
  * Faster than the original 4‑lane ARX chain with same quality.
  */
-static uint64_t plums_fast(const uint8_t * PLUMS_RESTRICT p,
+static PLUMS_INLINE uint64_t plums_fast(const uint8_t * PLUMS_RESTRICT p,
                            size_t len, uint64_t seed) {
     const uint8_t *e = p + len;
     static const uint64_t init[7] = {
@@ -231,7 +240,7 @@ static uint64_t plums_fast(const uint8_t * PLUMS_RESTRICT p,
  * serial chain is too short at these lengths for the fast‑path's
  * uncompensated lane compression.
  */
-static uint64_t plums_medium(const uint8_t * PLUMS_RESTRICT p,
+static PLUMS_INLINE uint64_t plums_medium(const uint8_t * PLUMS_RESTRICT p,
                              size_t len, uint64_t seed) {
     const uint8_t *e = p + len;
     uint64_t ba = seed ^ (len * PL_PHI);
@@ -300,7 +309,7 @@ static uint64_t plums_medium(const uint8_t * PLUMS_RESTRICT p,
  * for best avalanche on 32‑byte keys.  Result: 37.5 %
  * (fast‑path: 39.1 %, previous safe‑path: 31.2 %).
  */
-static uint64_t plums_safe(const uint8_t * PLUMS_RESTRICT p,
+static PLUMS_INLINE uint64_t plums_safe(const uint8_t * PLUMS_RESTRICT p,
                            size_t len, uint64_t seed) {
     const uint8_t *e = p + len;
     uint64_t ba = seed ^ (len * PL_PHI);
