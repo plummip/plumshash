@@ -301,9 +301,8 @@ static uint64_t plums_medium(const uint8_t * PLUMS_RESTRICT p,
         h1  = pl_rot(h1 + h2, 11);
     }
 
-    /* cross‑mix (same rot 33 as safe path — essential for diffusion
-     * when the serial chain is short) */
-    h2 ^= h1;   h2 = pl_rot(h2, 33);   h1 ^= h2;
+    /* cross‑mix — rotation 19 for best medium-path avalanche */
+    h2 ^= h1;   h2 = pl_rot(h2, 19);   h1 ^= h2;
 
     /* tail (0‑7 bytes) — __builtin_memcpy avoids function call */
     {
@@ -428,8 +427,11 @@ uint64_t plumshash(const void *buf, size_t len, uint64_t seed) {
     uint64_t h;
     if (PLUMS_LIKELY(len >= 128))
         h = plums_fast(p, len, mix);
-    else if (PLUMS_LIKELY(len <= 16))
-        h = plums_tiny(p, len, mix);   /* pre-mixed for security */
+    else if (PLUMS_LIKELY(len <= 16)) {
+        /* tiny path: seed already in init, whitening would cancel it.
+         * The 2-round M3/41/M3 chain is too short to absorb the undo. */
+        return plums_tiny(p, len, mix);
+    }
     else if (len >= 48)
         h = plums_medium(p, len, mix);
     else
