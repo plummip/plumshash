@@ -16,8 +16,9 @@
  *
  * ── Proven constants ──
  *
- *   Butterfly rotations  {17,25,33,49}, {19,27,35,43}, {21,29,37,53}
+ *   Butterfly rotations  {17,25,31,49}, {19,23,35,43}, {19,29,37,53}
  *     All odd, all gcd(r,64)=1, no intra-stage pair sums to 64.
+ *     All in PRIEMFORMULE safe columns (c ∈ {0,1,3,4,6,7}).
  *
  *   Round constants:  2× priemgetallen boven 2^63 (PRIEMFORMULE).
  *     rc[0..5]: eerste 6 priemen ≥ 2^63+1.
@@ -107,9 +108,9 @@ static const uint64_t ph2_rc[12] = {
  * 3 stages × 4 rotations.  All odd, gcd(r,64)=1, no intra-stage
  * pair sums to 64. */
 static const int ph2_rtab[3][4] = {
-    {17, 25, 33, 49},  /* adjacent pairs */
-    {19, 27, 35, 43},  /* stride-2      */
-    {21, 29, 37, 53},  /* stride-4      */
+    {17, 25, 31, 49},  /* adjacent pairs — 31 (c=3) replaces 33 (c=5 FORBIDDEN) */
+    {19, 23, 35, 43},  /* stride-2      — 23 (c=4) replaces 27 (c=8 FORBIDDEN) */
+    {19, 29, 37, 53},  /* stride-4      — 19 (c=0) replaces 21 (c=2 FORBIDDEN) */
 };
 
 /* ── ARX atom ── */
