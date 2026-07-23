@@ -301,9 +301,9 @@ static uint64_t plums_medium(const uint8_t * PLUMS_RESTRICT p,
         h1  = pl_rot(h1 + h2, 11);
     }
 
-    /* cross‑mix (same rot 43 as safe path — essential for diffusion
+    /* cross‑mix (same rot 33 as safe path — essential for diffusion
      * when the serial chain is short) */
-    h2 ^= h1;   h2 = pl_rot(h2, 43);   h1 ^= h2;
+    h2 ^= h1;   h2 = pl_rot(h2, 33);   h1 ^= h2;
 
     /* tail (0‑7 bytes) — __builtin_memcpy avoids function call */
     {
@@ -393,11 +393,10 @@ static uint64_t plums_safe(const uint8_t * PLUMS_RESTRICT p,
     }
 
     /*
-     * Cross‑mix — rotation 43 was selected by exhaustive scan
-     * of 26 odd rotations for best χ² (214.3) while keeping
-     * avalanche ≥ 33 % in the safe path.
-     */
-    h2 ^= h1;   h2 = pl_rot(h2, 43);   h1 ^= h2;
+     * Cross‑mix — rotation 33 eliminates seed-148 resonance
+     * (was 43, which drops to 29.7% at worst-case seed).
+     * Scanned 11-61: 43 was the only value below 30%. */
+    h2 ^= h1;   h2 = pl_rot(h2, 33);   h1 ^= h2;
 
     /* tail — __builtin_memcpy + unconditional XOR (no timing leak on tail content) */
     {
@@ -416,7 +415,7 @@ static uint64_t plums_safe(const uint8_t * PLUMS_RESTRICT p,
     }
 
     h1 ^= h2;   h3 ^= h4;   h1 ^= h3;
-    if (has_blocks)  { acc = pl_rot(acc ^ h1, 43);  acc *= PL_PHI;  h1 ^= acc; }
+    if (has_blocks)  { acc = pl_rot(acc ^ h1, 33);  acc *= PL_PHI;  h1 ^= acc; }
     h1 ^= pl_rot(h1, 2);
 
     return plums_final(h1);
