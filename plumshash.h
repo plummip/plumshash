@@ -425,9 +425,10 @@ static uint64_t plums_safe(const uint8_t * PLUMS_RESTRICT p,
     if (has_blocks)  { acc = pl_rot(acc ^ h1, 43);  acc *= PL_PHI;  h1 ^= acc; }
     h1 ^= pl_rot(h1, 2);
 
-    /* Wider state: 256 bits internal → 64 bits output.
-     * Two independent finalizer paths prevent single-point collision. */
-    return plums_final(h1) ^ plums_final(h2 ^ h3 ^ h4 ^ acc);
+    /* Wider state: fold all 5 state variables into finalizer input.
+     * Single finalizer call (8 ops) instead of two.
+     * 256 bits internal → 64 bits output. */
+    return plums_final(h1 ^ h2 ^ h3 ^ h4 ^ acc);
 }
 
 /* ── Dispatch ── */
