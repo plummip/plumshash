@@ -247,6 +247,13 @@ static uint64_t plums_fast(const uint8_t * PLUMS_RESTRICT p,
     return plums_final(L[0]);
 }
 
+/* ── Seed pre‑mixer ── */
+static PLUMS_INLINE uint64_t plums_mix(uint64_t x) {
+    x ^= x >> 33;  x *= 0xff51afd7ed558ccdULL;
+    x ^= x >> 33;  x *= 0xc4ceb9fe1a85ec53ULL;
+    return x ^ (x >> 33);
+}
+
 /*
  * ── Medium path (48 ≤ len < 128): pure ARX + cross‑mix, no accumulator ──
  *
@@ -270,11 +277,22 @@ static uint64_t plums_medium(const uint8_t * PLUMS_RESTRICT p,
     uint64_t h4 = ba * PL_M3;
 
     /* 32‑byte blocks (guaranteed at least 1 since len ≥ 48) */
+    /* Saturnin-style round keys — plums_mix per-key for max uniformity */
+    uint64_t rk1 = pl_rot(plums_mix(seed ^ 0xA5A5A5A5A5A5A5A5ULL), 13),
+             rk2 = pl_rot(plums_mix(seed ^ 0x3C3C3C3C3C3C3C3CULL), 19),
+             rk3 = pl_rot(plums_mix(seed ^ 0xF0F0F0F0F0F0F0F0ULL), 29),
+             rk4 = pl_rot(plums_mix(seed ^ 0x0F0F0F0F0F0F0F0FULL), 43);
+
     while (PLUMS_LIKELY(p + 32 <= e)) {
         h1 ^= pl_read64(p);  p += 8;  h1 = pl_rot(h1 + h2, 11);
         h2 ^= pl_read64(p);  p += 8;  h2 = pl_rot(h2 + h3, 17);
         h3 ^= pl_read64(p);  p += 8;  h3 = pl_rot(h3 + h4, 23);
-        h4 ^= pl_read64(p);  p += 8;  h4 = pl_rot(h4 + h1, 57);
+        h4 ^= pl_read64(p);  p += 8;  h4 = pl_rot(h4 + h1, 59);  /* prime */
+
+        h1 ^= rk1;  rk1 = pl_rot(rk1, 13);
+        h2 ^= rk2;  rk2 = pl_rot(rk2, 19);
+        h3 ^= rk3;  rk3 = pl_rot(rk3, 29);
+        h4 ^= rk4;  rk4 = pl_rot(rk4, 43);
     }
 
     /* remaining full 8‑byte words */
@@ -331,6 +349,12 @@ static uint64_t plums_safe(const uint8_t * PLUMS_RESTRICT p,
     uint64_t acc = ba ^ PL_M2;
     int has_blocks = 0;
 
+    /* Saturnin-style round keys — plums_mix per-key for max uniformity */
+    uint64_t rk1 = pl_rot(plums_mix(seed ^ 0xA5A5A5A5A5A5A5A5ULL), 13),
+             rk2 = pl_rot(plums_mix(seed ^ 0x3C3C3C3C3C3C3C3CULL), 19),
+             rk3 = pl_rot(plums_mix(seed ^ 0xF0F0F0F0F0F0F0F0ULL), 29),
+             rk4 = pl_rot(plums_mix(seed ^ 0x0F0F0F0F0F0F0F0FULL), 43);
+
     while (PLUMS_LIKELY(p + 32 <= e)) {
         uint64_t v1 = pl_read64(p);  p += 8;
         uint64_t v2 = pl_read64(p);  p += 8;
@@ -340,11 +364,18 @@ static uint64_t plums_safe(const uint8_t * PLUMS_RESTRICT p,
         h1 ^= v1;  h1 = pl_rot(h1 + h2, 11);
         h2 ^= v2;  h2 = pl_rot(h2 + h3, 17);
         h3 ^= v3;  h3 = pl_rot(h3 + h4, 23);
-        h4 ^= v4;  h4 = pl_rot(h4 + h1, 57);
+        h4 ^= v4;  h4 = pl_rot(h4 + h1, 59);  /* prime — was 57 */
 
         acc ^= v1 ^ v2 ^ v3 ^ v4;
         acc  = pl_rot(acc, 31);
         acc *= PL_PHI;
+
+        /* re-inject and rotate round keys (Saturnin schedule) */
+        h1 ^= rk1;  rk1 = pl_rot(rk1, 13);
+        h2 ^= rk2;  rk2 = pl_rot(rk2, 19);
+        h3 ^= rk3;  rk3 = pl_rot(rk3, 29);
+        h4 ^= rk4;  rk4 = pl_rot(rk4, 43);
+
         has_blocks = 1;
     }
 
@@ -383,13 +414,6 @@ static uint64_t plums_safe(const uint8_t * PLUMS_RESTRICT p,
     h1 ^= pl_rot(h1, 2);
 
     return plums_final(h1);
-}
-
-/* ── Seed pre‑mixer ── */
-static PLUMS_INLINE uint64_t plums_mix(uint64_t x) {
-    x ^= x >> 33;  x *= 0xff51afd7ed558ccdULL;
-    x ^= x >> 33;  x *= 0xc4ceb9fe1a85ec53ULL;
-    return x ^ (x >> 33);
 }
 
 /* ── Dispatch ── */
