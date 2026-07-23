@@ -108,11 +108,11 @@ static PLUMS_INLINE uint64_t pl_rotr23(uint64_t x) {
     return (x >> 23) | (x << 41);
 }
 
-/* Minimal S-box on 64-bit lanes — 1 AND + lane rotation (2 ops).
- * AND provides nonlinearity; rotation ensures all lane pairs mix.
- * Empirically same avalanche gain as 6-op Saturnin sigma_0. */
+/* Saturnin sigma_0 S-box on 64-bit lanes — 6 AND/OR/XOR, zero latency.
+ * Output rotated: {h1,h2,h3,h4} = {h2,h3,h4,h1} */
 #define PLUMS_SBOX(h1,h2,h3,h4) do { \
-    h1 ^= h2 & h3; \
+    h1 ^= h2 & h3; h2 ^= h1 | h4; h4 ^= h2 | h3; \
+    h3 ^= h2 & h4; h2 ^= h1 | h3; h1 ^= h2 | h4; \
     { uint64_t _st = h1; h1 = h2; h2 = h3; h3 = h4; h4 = _st; } \
 } while(0)
 
