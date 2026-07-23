@@ -108,6 +108,15 @@ static PLUMS_INLINE uint64_t pl_rotr23(uint64_t x) {
     return (x >> 23) | (x << 41);
 }
 
+/* Saturnin sigma_0 S-box on 64-bit lanes — 6 AND/OR/XOR, zero latency.
+ * Breaks linear structure that causes pattern-key clustering.
+ * Output rotated: {h1,h2,h3,h4} = {h2,h3,h4,h1} */
+#define PLUMS_SBOX(h1,h2,h3,h4) do { \
+    h1 ^= h2 & h3; h2 ^= h1 | h4; h4 ^= h2 | h3; \
+    h3 ^= h2 & h4; h2 ^= h1 | h3; h1 ^= h2 | h4; \
+    { uint64_t _st = h1; h1 = h2; h2 = h3; h3 = h4; h4 = _st; } \
+} while(0)
+
 static PLUMS_INLINE uint64_t pl_read64(const uint8_t *p) {
     uint64_t v;
     memcpy(&v, p, sizeof(v));
@@ -366,6 +375,9 @@ static uint64_t plums_safe(const uint8_t * PLUMS_RESTRICT p,
         h3 ^= v3;  h3 = pl_rot(h3 + h4, 23);
         h4 ^= v4;  h4 = pl_rot(h4 + h1, 57);
 
+        /* Saturnin S-box — nonlinear mixing breaks linear structure */
+        PLUMS_SBOX(h1, h2, h3, h4);
+
         acc ^= v1 ^ v2 ^ v3 ^ v4;
         acc  = pl_rot(acc, 31);
         acc *= PL_PHI;
@@ -413,7 +425,9 @@ static uint64_t plums_safe(const uint8_t * PLUMS_RESTRICT p,
     if (has_blocks)  { acc = pl_rot(acc ^ h1, 43);  acc *= PL_PHI;  h1 ^= acc; }
     h1 ^= pl_rot(h1, 2);
 
-    return plums_final(h1);
+    /* Wider state: 256 bits internal → 64 bits output.
+     * Two independent finalizer paths prevent single-point collision. */
+    return plums_final(h1) ^ plums_final(h2 ^ h3 ^ h4 ^ acc);
 }
 
 /* ── Dispatch ── */
