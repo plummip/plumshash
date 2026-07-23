@@ -285,9 +285,9 @@ static uint64_t plums_medium(const uint8_t * PLUMS_RESTRICT p,
 
     while (PLUMS_LIKELY(p + 32 <= e)) {
         h1 ^= pl_read64(p);  p += 8;  h1 = pl_rot(h1 + h2, 11);
-        h2 ^= pl_read64(p);  p += 8;  h2 = pl_rot(h2 + h3, 17);
-        h3 ^= pl_read64(p);  p += 8;  h3 = pl_rot(h3 + h4, 23);
-        h4 ^= pl_read64(p);  p += 8;  h4 = pl_rot(h4 + h1, 57);
+        h2 ^= pl_read64(p);  p += 8;  h2 = pl_rot(h2 + h3, 25);
+        h3 ^= pl_read64(p);  p += 8;  h3 = pl_rot(h3 + h4, 43);
+        h4 ^= pl_read64(p);  p += 8;  h4 = pl_rot(h4 + h1, 59);
 
         h1 ^= rk1;  rk1 = pl_rot(rk1, 13);
         h2 ^= rk2;  rk2 = pl_rot(rk2, 19);
@@ -301,8 +301,8 @@ static uint64_t plums_medium(const uint8_t * PLUMS_RESTRICT p,
         h1  = pl_rot(h1 + h2, 11);
     }
 
-    /* cross‑mix — rotation 19 for best medium-path avalanche */
-    h2 ^= h1;   h2 = pl_rot(h2, 19);   h1 ^= h2;
+    /* cross‑mix — rotation 21 for best medium-path avalanche */
+    h2 ^= h1;   h2 = pl_rot(h2, 21);   h1 ^= h2;
 
     /* tail (0‑7 bytes) — __builtin_memcpy avoids function call */
     {
