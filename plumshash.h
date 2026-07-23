@@ -405,11 +405,11 @@ uint64_t plumshash(const void *buf, size_t len, uint64_t seed) {
         h = plums_medium(p, len, mix);
     else
         h = plums_safe(p, len, mix);
-    /* key whitening — seed re-injected after finalizer to prevent
-     * seed-independent collision attacks (SipHash-style defence).
-     * An attacker who forces the pre-final state still can't
-     * predict the final hash without knowing the seed. */
-    h ^= plums_mix(seed ^ (len * PL_PHI));
+    /* key whitening — re-inject pre-mixed seed after finalizer.
+     * Uses the already-computed mix (plums_mix(seed)) + length factor.
+     * 2 ops instead of a second plums_mix call (8 ops).
+     * Attacker who forces pre-final state still can't predict output. */
+    h ^= mix ^ (len * PL_PHI);
     return h;
 }
 
