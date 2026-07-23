@@ -17,3 +17,5 @@ fastdb
 
 # Python
 __pycache__/
+bench_compare
+rapidhash.h

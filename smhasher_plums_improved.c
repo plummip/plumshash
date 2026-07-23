@@ -1,20 +1,17 @@
 /*
- * smhasher_plums_improved.c — SMHasher-grade verification for plumsHash improved
+ * smhasher_plums_improved.c — Extended SMHasher-grade verification for PlumsHash
  *
  * Compile:
- *   cd ~/projects/plumshash
- *   gcc -O3 -march=native -I./include -o smhasher_plums_improved \
- *       smhasher_plums_improved.c -lm
+ *   gcc -O3 -march=armv8-a -Wall -Wextra -o smhasher_plums_improved \
+ *       smhasher_plums_improved.c -I. -lm
  *   ./smhasher_plums_improved
  *
- * Reuses the same test framework as smhasher_plums.c but links
- * against the improved hash via tpde's include path.
+ * Tests all 4 dispatch paths (tiny/safe/medium/fast), seed independence,
+ * path boundary overlap, plus standard SMHasher checks.
  * Standalone single-file test — no external SMHasher needed.
  */
 #define PLUMSHASH_IMPLEMENTATION
-#define PLUMSHASH_IMPROVED_IMPLEMENTATION
 #include "plumshash.h"
-#include "../acht/include/tpde/core/plumshash_improved.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -41,16 +38,16 @@ static int pass = 0, fail = 0;
 static void test_sanity(void) {
     printf("── Sanity ──\n");
     TEST("deterministic",
-        plumshash_improved("hello", 5, 42) == plumshash_improved("hello", 5, 42));
+        plumshash("hello", 5, 42) == plumshash("hello", 5, 42));
     TEST("seed_diff",
-        plumshash_improved("hello", 5, 0) != plumshash_improved("hello", 5, 1));
+        plumshash("hello", 5, 0) != plumshash("hello", 5, 1));
     TEST("key_diff",
-        plumshash_improved("hello", 5, 0) != plumshash_improved("world", 5, 0));
+        plumshash("hello", 5, 0) != plumshash("world", 5, 0));
     /* empty key with seed 0 produces a defined non-zero value */
     TEST("empty_key",
-        plumshash_improved("", 0, 42) == plumshash_improved("", 0, 42));
+        plumshash("", 0, 42) == plumshash("", 0, 42));
     TEST("all_zeroes_16",
-        plumshash_improved("\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0", 16, 0) != 0);
+        plumshash("\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0", 16, 0) != 0);
 }
 
 /* ══════════════════════════════════════════════════════════════════════ */
@@ -61,6 +58,7 @@ static void test_sanity(void) {
 static void test_avalanche(void) {
     printf("── Avalanche ──\n");
     uint8_t buf[256];
+    memset(buf, 0xA5, sizeof(buf));  /* deterministic init */
 
     /* Tiny path: 16 bytes */
     {
@@ -68,9 +66,9 @@ static void test_avalanche(void) {
         for (int by = 0; by < 16; by++) {
             for (int bi = 0; bi < 8; bi++) {
                 buf[by] ^= (uint8_t)(1u << bi);
-                uint64_t h0 = plumshash_improved(buf, 16, 42 + by * 8 + bi);
+                uint64_t h0 = plumshash(buf, 16, 42 + by * 8 + bi);
                 buf[by] ^= (uint8_t)(1u << bi);
-                uint64_t h1 = plumshash_improved(buf, 16, 42 + by * 8 + bi);
+                uint64_t h1 = plumshash(buf, 16, 42 + by * 8 + bi);
                 double p = popcount(h0 ^ h1) / 64.0 * 100.0;
                 if (p < worst) worst = p;
             }
@@ -85,9 +83,9 @@ static void test_avalanche(void) {
         for (int by = 0; by < 32; by++) {
             for (int bi = 0; bi < 8; bi++) {
                 buf[by] ^= (uint8_t)(1u << bi);
-                uint64_t h0 = plumshash_improved(buf, 32, 42 + by * 8 + bi);
+                uint64_t h0 = plumshash(buf, 32, 42 + by * 8 + bi);
                 buf[by] ^= (uint8_t)(1u << bi);
-                uint64_t h1 = plumshash_improved(buf, 32, 42 + by * 8 + bi);
+                uint64_t h1 = plumshash(buf, 32, 42 + by * 8 + bi);
                 double p = popcount(h0 ^ h1) / 64.0 * 100.0;
                 if (p < worst) worst = p;
             }
@@ -102,9 +100,9 @@ static void test_avalanche(void) {
         for (int by = 0; by < 64; by++) {
             for (int bi = 0; bi < 8; bi++) {
                 buf[by] ^= (uint8_t)(1u << bi);
-                uint64_t h0 = plumshash_improved(buf, 64, 42 + by * 8 + bi);
+                uint64_t h0 = plumshash(buf, 64, 42 + by * 8 + bi);
                 buf[by] ^= (uint8_t)(1u << bi);
-                uint64_t h1 = plumshash_improved(buf, 64, 42 + by * 8 + bi);
+                uint64_t h1 = plumshash(buf, 64, 42 + by * 8 + bi);
                 double p = popcount(h0 ^ h1) / 64.0 * 100.0;
                 if (p < worst) worst = p;
             }
@@ -119,9 +117,9 @@ static void test_avalanche(void) {
         for (int by = 0; by < 64; by++) {
             for (int bi = 0; bi < 8; bi++) {
                 buf[by] ^= (uint8_t)(1u << bi);
-                uint64_t h0 = plumshash_improved(buf, 256, 42 + by * 8 + bi);
+                uint64_t h0 = plumshash(buf, 256, 42 + by * 8 + bi);
                 buf[by] ^= (uint8_t)(1u << bi);
-                uint64_t h1 = plumshash_improved(buf, 256, 42 + by * 8 + bi);
+                uint64_t h1 = plumshash(buf, 256, 42 + by * 8 + bi);
                 double p = popcount(h0 ^ h1) / 64.0 * 100.0;
                 if (p < worst) worst = p;
             }
@@ -144,8 +142,8 @@ static void test_differential(void) {
     double sum_p = 0.0;
     int n = 512;
     for (int i = 0; i < n; i++) {
-        uint64_t h0 = plumshash_improved(buf, 64, i);
-        uint64_t h1 = plumshash_improved(buf, 64, i + 1);
+        uint64_t h0 = plumshash(buf, 64, i);
+        uint64_t h1 = plumshash(buf, 64, i + 1);
         sum_p += popcount(h0 ^ h1);
     }
     double avg_bits = sum_p / n;
@@ -156,9 +154,9 @@ static void test_differential(void) {
     sum_p = 0.0;
     for (int i = 0; i < n; i++) {
         memset(buf, i & 0xFF, 64);
-        uint64_t h0 = plumshash_improved(buf, 64, seed);
+        uint64_t h0 = plumshash(buf, 64, seed);
         memset(buf, (i+1) & 0xFF, 64);
-        uint64_t h1 = plumshash_improved(buf, 64, seed + i);
+        uint64_t h1 = plumshash(buf, 64, seed + i);
         sum_p += popcount(h0 ^ h1);
     }
     avg_bits = sum_p / n;
@@ -175,7 +173,7 @@ static void test_chi2(void) {
     const int N = 256000;
 
     for (int i = 0; i < N; i++) {
-        uint64_t h = plumshash_improved(&i, sizeof(i), i);
+        uint64_t h = plumshash(&i, sizeof(i), i);
         bins[h & 0xFF]++;
     }
 
@@ -207,7 +205,7 @@ static void test_sparse(void) {
             memset(key, 0, klen);
             key[klen - 1] = (uint8_t)val;
             if (pos & 1) key[0] = (uint8_t)(pos ^ val);
-            seen[ngen++] = plumshash_improved(key, (size_t)klen, 0);
+            seen[ngen++] = plumshash(key, (size_t)klen, 0);
         }
     }
 
@@ -230,7 +228,7 @@ static void test_permutation(void) {
     uint8_t buf[32];
     for (int i = 0; i < 32; i++) buf[i] = (uint8_t)(i * 7 + 3);
 
-    uint64_t base = plumshash_improved(buf, 32, 0);
+    uint64_t base = plumshash(buf, 32, 0);
     int diff_count = 0;
 
     for (int i = 0; i < 31; i++) {
@@ -238,7 +236,7 @@ static void test_permutation(void) {
         buf[i] = buf[i+1];
         buf[i+1] = tmp;
 
-        uint64_t h = plumshash_improved(buf, 32, 0);
+        uint64_t h = plumshash(buf, 32, 0);
         if (h != base) diff_count++;
 
         buf[i+1] = buf[i];
@@ -255,7 +253,7 @@ static void test_permutation(void) {
 static void test_appended_zeroes(void) {
     printf("── AppendedZeroes ──\n");
     const char *key = "test";
-    uint64_t h0 = plumshash_improved(key, 4, 0);
+    uint64_t h0 = plumshash(key, 4, 0);
 
     uint8_t buf[32];
     memset(buf, 0, 32);
@@ -263,7 +261,7 @@ static void test_appended_zeroes(void) {
 
     int diff_count = 0;
     for (int i = 5; i <= 20; i++) {
-        uint64_t h = plumshash_improved(buf, (size_t)i, 0);
+        uint64_t h = plumshash(buf, (size_t)i, 0);
         if (h != h0) diff_count++;
     }
 
@@ -282,14 +280,14 @@ static void test_seed_independence(void) {
 
     double avals[50];
     for (int s = 0; s < 50; s++) {
-        uint64_t base_h = plumshash_improved(buf, 64, s);
+        uint64_t base_h = plumshash(buf, 64, s);
         double total = 0.0;
         int trials = 128;
         for (int t = 0; t < trials; t++) {
             int by = (t * 7) % 64;
             int bi = (t * 13) % 8;
             buf[by] ^= (uint8_t)(1u << bi);
-            uint64_t h = plumshash_improved(buf, 64, s);
+            uint64_t h = plumshash(buf, 64, s);
             buf[by] ^= (uint8_t)(1u << bi);
             total += popcount(base_h ^ h);
         }
@@ -323,7 +321,7 @@ static void test_path_boundary(void) {
     for (int r = 0; r < 100; r++) {
         for (int i = 0; i < 256; i++) buf[i] = rand() & 0xFF;
         for (int i = 0; i < 6; i++)
-            hv[i] = plumshash_improved(buf, bounds[i], 0);
+            hv[i] = plumshash(buf, bounds[i], 0);
         for (int i = 0; i < 6; i++)
             for (int j = i+1; j < 6; j++)
                 if (hv[i] == hv[j]) boundary_ok = 0;
