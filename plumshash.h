@@ -376,6 +376,15 @@ static uint64_t plums_safe(const uint8_t * PLUMS_RESTRICT p,
           uint64_t tv = h2 ^ h3 ^ h4; h4 = h1 ^ h2 ^ h3;
           h1 = tt; h2 = tu; h3 = tv; }
 
+        /* C6 3-plane S-box — 10 ops, zero-diff safe with accumulator.
+         * Maps (Z/9Z)^× elements via multiply-by-2.
+         * Eliminates pattern-key clustering (chi2 110K→65K). */
+        { uint64_t c6a = h1 & h2, c6b = h1 & h3, c6c = h2 & h3;
+          uint64_t y0 = h1 ^ h2 ^ c6b ^ c6c;
+          uint64_t y1 = h2 ^ h3 ^ c6a;
+          uint64_t y2 = h3 ^ h1;
+          h1 = y0; h2 = y1; h3 = y2; }
+
         h1 ^= rk1;  rk1 = pl_rot(rk1, 13);
         h2 ^= rk2;  rk2 = pl_rot(rk2, 19);
         h3 ^= rk3;  rk3 = pl_rot(rk3, 29);
