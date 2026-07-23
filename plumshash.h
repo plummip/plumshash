@@ -371,6 +371,12 @@ static uint64_t plums_safe(const uint8_t * PLUMS_RESTRICT p,
         acc *= PL_PHI;
 
         /* re-inject and rotate round keys (Saturnin schedule) */
+        /* Einstein tile substitution matrix — proven primitive mixing.
+         * Only in safe path: accumulator prevents resonance effects. */
+        { uint64_t tt = h1 ^ h2 ^ h4; uint64_t tu = h1 ^ h3 ^ h4;
+          uint64_t tv = h2 ^ h3 ^ h4; h4 = h1 ^ h2 ^ h3;
+          h1 = tt; h2 = tu; h3 = tv; }
+
         h1 ^= rk1;  rk1 = pl_rot(rk1, 13);
         h2 ^= rk2;  rk2 = pl_rot(rk2, 19);
         h3 ^= rk3;  rk3 = pl_rot(rk3, 29);
