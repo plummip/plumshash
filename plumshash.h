@@ -167,11 +167,15 @@ static PLUMS_INLINE uint64_t plums_tiny(const uint8_t * PLUMS_RESTRICT p,
     }
 
     /* Multiply/rotate constants selected by scanning 4×4×63 combos for
-     * lowest χ² on 4‑byte keys (M3/41/M3 beats M1/51/PHI, 196.0 vs 217.9). */
+     * lowest χ² on 4‑byte keys (M3/41/M3 beats M1/51/PHI, 196.0 vs 217.9).
+     * Third round (M1/17) added for length-extension resistance —
+     * prevents bit correlation on 1-byte appends to short messages. */
     h  = a * PL_M3;
     h ^= b;
     h  = pl_rot(h, 41);
     h *= PL_M3;
+    h ^= pl_rot(h, 17);
+    h *= PL_M1;
     return plums_final(h);
 }
 
