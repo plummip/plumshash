@@ -261,6 +261,16 @@ static uint64_t plums_fast(const uint8_t * PLUMS_RESTRICT p,
         }
     }
 
+    /* Nonlinear lane folding: the rotr23 lane mixes are linear in the data,
+     * and a pure XOR compression tree collapses low-weight keys (SMHasher
+     * Combination 16/32-byte-block tests: 100K keys -> ~4K distinct hashes).
+     * One mum per lane (parallel, off the critical path) breaks the
+     * linearity before the compression tree. */
+    for (int i = 0; i < 7; i++) {
+        __uint128_t r = (__uint128_t)L[i] * (plums_fast_init[i] ^ seed);
+        L[i] = (uint64_t)r ^ (uint64_t)(r >> 64);
+    }
+
     /* Balanced compression tree — all lanes contribute equally */
     L[0] ^= pl_rot(L[4], 11);
     L[1] ^= pl_rot(L[5], 17);
