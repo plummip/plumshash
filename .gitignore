@@ -3,19 +3,31 @@
 *.so
 *.a
 
-# Build outputs
-_smhasher_plums
+# Build outputs (see Makefile)
+quality_hybrid
+edgecheck_hybrid
+repro_comb16
+verify_identical
+bench_hybrid
+bench_compete
+security_test
+smhasher_plums
 smhasher_plums_improved
 _seed_test
 _test128
-test_plum
+test_mini
 test_speed
+test_edge
+test_extensive
+test_extensive_O
+bench_compare
+bench_ab
+bench_ab6
 fastdb
+verif
 
 # Data files
 *.fastdb
 
 # Python
 __pycache__/
-bench_compare
-rapidhash.h
