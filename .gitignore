@@ -1,0 +1,38 @@
+# ── Build artifacts ──────────────────────────────────────────────────────
+*.o
+*.a
+*.so
+*.d
+*.out
+bench_results.txt
+
+# ── Build outputs (see Makefile) ─────────────────────────────────────────
+test_sanitize
+test_quality
+test_comb16
+test_security
+smhasher_plums
+test_edge
+test_extensive
+bench_compete
+test_speed
+bench_plums
+
+# ── Tooling ──────────────────────────────────────────────────────────────
+compile_commands.json
+.cache/
+build/
+out/
+
+# ── Editors / OS ─────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+
+# ── SMHasher clone (see README, "SMHasher") ──────────────────────────────
+smhasher/
+
+# ── Python ───────────────────────────────────────────────────────────────
+__pycache__/

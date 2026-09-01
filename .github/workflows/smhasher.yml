@@ -1,0 +1,36 @@
+name: SMHasher
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'plumshash.h'
+      - 'smhasher_plums.c'
+      - '.github/workflows/smhasher.yml'
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  smhasher:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build SMHasher test
+        run: gcc -O3 -Wall -Wextra -o smhasher_plums smhasher_plums.c -lm
+
+      - name: Run SMHasher tests
+        run: ./smhasher_plums
+
+  # Run on aarch64 (ARM64) for native benchmarking
+  smhasher-aarch64:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build SMHasher test (aarch64)
+        run: gcc -O3 -Wall -Wextra -o smhasher_plums smhasher_plums.c -lm
+
+      - name: Run SMHasher tests (aarch64)
+        run: ./smhasher_plums

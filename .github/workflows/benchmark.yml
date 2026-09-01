@@ -1,0 +1,38 @@
+name: Benchmark
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'plumshash.h'
+      - '.github/workflows/benchmark.yml'
+  workflow_dispatch:
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        compiler: [gcc, clang]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build benchmark
+        run: ${{ matrix.compiler }} -O3 -Wall -Wextra -o bench_plums test_speed.c
+
+      - name: Run benchmark
+        run: ./bench_plums
+
+  benchmark-aarch64:
+    runs-on: ubuntu-24.04-arm
+    strategy:
+      matrix:
+        compiler: [gcc, clang]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build benchmark (aarch64)
+        run: ${{ matrix.compiler }} -O3 -Wall -Wextra -o bench_plums test_speed.c
+
+      - name: Run benchmark (aarch64)
+        run: ./bench_plums
