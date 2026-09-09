@@ -6,7 +6,7 @@ CFLAGS   ?= -O3 -march=native -Wall -Wextra
 REF      := -Irefs -Irefs/t1ha -I.
 
 TESTS    := test_sanitize test_quality test_comb16 test_security \
-            smhasher_plums test_edge test_extensive
+            smhasher_plums test_edge test_extensive test_hybrid
 BENCHES  := bench_compete test_speed
 BINS     := $(TESTS) $(BENCHES)
 
@@ -36,6 +36,9 @@ test_edge: test_edge.c plumshash.h
 test_extensive: test_extensive.c plumshash.h
 	$(CC) $(CFLAGS) $(REF) -o $@ test_extensive.c
 
+test_hybrid: test_hybrid.c plumshash.h hybrid_intern.h
+	$(CC) $(CFLAGS) -pthread -o $@ test_hybrid.c
+
 # ── benchmarks ───────────────────────────────────────────────────────────
 bench_compete: bench_compete.c plumshash.h refs/rapidhash.h refs/wyhash.h refs/xxhash.h refs/t1ha/t1ha2.c
 	$(CC) $(CFLAGS) $(REF) -o $@ bench_compete.c refs/t1ha/t1ha2.c
@@ -51,6 +54,7 @@ test: all
 	./test_quality | tail -1
 	./test_comb16 | grep -vcE 'distinct, maxgroup=1' || true
 	./test_security | tail -1
+	./test_hybrid | tail -1
 
 bench: bench_compete test_speed
 	./bench_compete
