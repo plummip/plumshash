@@ -1,46 +1,37 @@
 /*
- * hybrid_intern.h — lock-free-read, write-serialized intern pool
- *                   built on PlumsHash.
+ * hybrid_intern.h — lock-free-read, write-serialized intern pool on
+ *                   PlumsHash, with SPUR-tier + e-mesh-epoch reclamation.
  * =========================================================================
- * A string-interning structure with two tiers:
- *   - Short pool: strings <= SHORT_MAX_LEN (typically identifiers) in a
- *     smaller, hotter pool.
- *   - Long pool : longer strings in a larger pool.
+ * A string-interning structure with two tiers of STORAGE and two tiers of
+ * LIFETIME, grounded in the same machinery as achtc's memory model:
  *
- * Both tiers store string bytes in an IMMUTABLE bump-allocated arena and
- * index them by slot position, so str() returns a raw pointer (zero-copy)
- * that stays valid for the pool's lifetime — an evicted entry's bytes are
- * never freed or overwritten (the arena is released only at pool destroy).
+ *   LIFETIME TIERS (SPUR):
+ *     T0  transient — intern(s) puts a string here. It is reclaimed in bulk
+ *         at the next epoch boundary. Zero-copy pointers into T0 are valid
+ *         only until hybrid_epoch_end().
+ *     T1  stable   — intern_stable(s) puts a string here. It survives epoch
+ *         boundaries; its bytes live until the pool is destroyed.
  *
- * Handles are NaN-boxed 64-bit values: {pos(28) | gen(8) | pool(13) | tier}.
- * They are valid NaNs, so they can live inside a double in a tagged-union
- * language runtime without a separate discriminant word.
+ *   EPOCHS (e-mesh):
+ *     hybrid_epoch_end() returns the T0 bump arena to its base in one bulk
+ *     free (no per-entry work). The contract is that every T0 entry is
+ *     evicted before the boundary; an additive-multiset fingerprint (the
+ *     e-mesh `eg_w` fold: XOR of per-string hashes, self-inverse) is kept
+ *     across intern(+)/evict(-) and verified to be zero at the boundary —
+ *     so a live T0 entry that would be reclaimed is DETECTED, not silently
+ *     dropped. T1's fingerprint is monotonic and checked on demand.
  *
- * CONCURRENCY MODEL
- * -----------------
- *   - Reads  (str lookup) are LOCK-FREE: a per-pool seqlock makes each read
- *     a consistent snapshot, so a concurrent evict+re-intern can only yield
- *     the intact old string (gen still matched) or NULL (stale) — never a
- *     torn {gen, offset} pair. The returned pointer is to immutable arena
- *     bytes, so it never dangles.
- *   - Writes (intern / evict) are serialized by a per-pool pthread mutex.
+ *   SIZE TIERS (independent): strings <= SHORT_MAX_LEN go to a smaller,
+ *   hotter short pool; longer strings to the long pool. Both pools carry a
+ *   full T0/T1 pair.
  *
- * Why not fully lock-free? A fixed-size slot holds {hash, gen, len, chunk,
- * offset} that cannot be published atomically with one CAS. Serializing
- * writers (mutex) + publishing payload-last behind the seqlock makes reads
- * lock-free and consistent. Interning is rare relative to lookup.
- *
- * PORTABILITY
- * -----------
- *   - No AVX2 requirement: the vectorized compare is used only under
- *     __AVX2__ (x86-64 -mavx2); elsewhere (incl. AArch64) memcmp is used.
- *     The AVX2 path is safe because arena payloads are padded to 32-byte
- *     multiples.
- *   - Handles are NaN-boxed; portable to every AArch64/x86-64 compiler that
- *     preserves IEEE-754 NaN payloads.
+ * All string bytes live in IMMUTABLE bump-allocated arenas, so str() is
+ * zero-copy: it returns a raw pointer. Reads are lock-free behind a
+ * per-pool seqlock; writes are serialized by a pthread mutex. Handles are
+ * NaN-boxed {pos | gen | pool | tier}.
  *
  * Use:
- *   #define PLUMSHASH_IMPLEMENTATION   // in exactly one .c file
+ *   #define PLUMSHASH_IMPLEMENTATION
  *   #include "hybrid_intern.h"
  *
  * Compile: -O3 -std=c11 -march=native -pthread
@@ -64,7 +55,7 @@
 #include <unistd.h>
 #endif
 
-#include "plumshash.h"   /* uint64_t plumshash(const void*, size_t, uint64_t) */
+#include "plumshash.h"
 
 /* ----------------------------------------------------------------------
  * TUNING
@@ -87,27 +78,29 @@
 #define LONG_MAX_CHUNKS 256
 
 /* ----------------------------------------------------------------------
- * HANDLE ENCODING (NaN-boxed)
+ * HANDLE ENCODING (NaN-boxed): {rank | gen | pool | tier}
  * ---------------------------------------------------------------------- */
-#define IR_TIER_T2      0x3ULL
 #define IR_NAN          0x7FF0000000000000ULL
 #define IR_RANK_SH      24
 #define IR_GEN_SH       16
 #define IR_POOL_SH      3
+#define IR_TIER_T0      0x1ULL   /* transient (epoch-scoped) */
+#define IR_TIER_T1      0x2ULL   /* stable */
 
 typedef union { uint64_t u; void *p; } SF_Handle;
 #define SF_NULL ((SF_Handle){ .u = 0 })
 
-static inline SF_Handle _encode_handle(uint32_t rank, uint8_t gen, uint16_t pool_id) {
+static inline SF_Handle _encode_handle(uint32_t rank, uint8_t gen, uint16_t pool_id, uint64_t tier) {
     return (SF_Handle){ .u = IR_NAN |
         ((uint64_t)rank    << IR_RANK_SH) |
         ((uint64_t)gen     << IR_GEN_SH)  |
         ((uint64_t)pool_id << IR_POOL_SH) |
-        IR_TIER_T2 };
+        tier };
 }
 static inline uint32_t _handle_rank(SF_Handle h) { return (uint32_t)((h.u >> IR_RANK_SH) & 0x0FFFFFFFull); }
 static inline uint8_t  _handle_gen (SF_Handle h) { return (uint8_t) ((h.u >> IR_GEN_SH)  & 0xFFull); }
 static inline uint16_t _handle_pool(SF_Handle h) { return (uint16_t)((h.u >> IR_POOL_SH) & 0x1FFFull); }
+static inline uint64_t _handle_tier(SF_Handle h) { return h.u & 0x3ull; }
 static inline bool     _handle_valid(SF_Handle h) { return (h.u & 0x7FF0000000000000ULL) == IR_NAN; }
 
 /* ----------------------------------------------------------------------
@@ -116,38 +109,28 @@ static inline bool     _handle_valid(SF_Handle h) { return (h.u & 0x7FF000000000
 static inline void _lock(pthread_mutex_t *m) { pthread_mutex_lock(m); }
 static inline void _unlock(pthread_mutex_t *m) { pthread_mutex_unlock(m); }
 
-/* Seqlock: writers (already serialized by the mutex) bump seq odd before
- * mutating and even after. A reader copies out only across a stable (even,
- * unchanged) seq, so it never observes a torn {gen, offset} pair. */
 static inline void _seq_begin(_Atomic uint32_t *s) { atomic_fetch_add_explicit(s, 1, memory_order_release); }
 static inline void _seq_end  (_Atomic uint32_t *s) { atomic_fetch_add_explicit(s, 1, memory_order_release); }
 
-/* ----------------------------------------------------------------------
- * Entropy (best-effort seed; PlumsHash is safe with seed==0 anyway)
- * ---------------------------------------------------------------------- */
 static uint64_t _entropy(void) {
     uint64_t s = 0;
 #ifdef __linux__
     if (getrandom(&s, sizeof(s), 0) != (ssize_t)sizeof(s))
 #endif
-    {
-        s = (uint64_t)(uintptr_t)&s;
-        s ^= (uint64_t)time(NULL) * 0x9E3779B97F4A7C15ULL;
-    }
+    { s = (uint64_t)(uintptr_t)&s; s ^= (uint64_t)time(NULL) * 0x9E3779B97F4A7C15ULL; }
     return s;
 }
 
 /* ----------------------------------------------------------------------
- * IMMUTABLE ARENA — bump-allocated chunks, never freed until pool destroy
+ * IMMUTABLE BUMP ARENA
  * ---------------------------------------------------------------------- */
 typedef struct DataChunk {
     struct DataChunk  *next;
     uint32_t           cap;
     _Atomic uint32_t   bump;
-    uint8_t            _pad[48];   /* 8+4+4+48 = 64, so data[] lands 64B-aligned */
+    uint8_t            _pad[48];
     uint8_t            data[];
 } DataChunk;
-
 _Static_assert(sizeof(DataChunk) == 64, "DataChunk must be 64 bytes");
 
 typedef struct {
@@ -166,7 +149,16 @@ static DataChunk *_arena_chunk_new(uint32_t cap) {
     return c;
 }
 
-/* writer-side only (called under the pool lock) */
+static void _arena_init(Arena *a, uint32_t first_cap) {
+    a->chunks[0] = _arena_chunk_new(first_cap);
+    a->n_chunks = 1;
+    a->cur_chunk = 0;
+}
+
+static void _arena_free(Arena *a) {
+    for (uint16_t i = 0; i < a->n_chunks; i++) free(a->chunks[i]);
+}
+
 static void _arena_alloc(Arena *a, uint32_t len, uint8_t *cid_out, uint32_t *off_out) {
     uint32_t need = (len + 31) & ~31;
     if (!need) need = 32;
@@ -188,48 +180,51 @@ static void _arena_alloc(Arena *a, uint32_t len, uint8_t *cid_out, uint32_t *off
 }
 
 /* ----------------------------------------------------------------------
- * POOL — slot-indexed headers + immutable arena
+ * POOL — slot-indexed headers + T0/T1 arenas + fingerprint
  * ---------------------------------------------------------------------- */
 typedef enum : uint8_t { LK_FREE = 0, LK_OWNED = 1 } EntryKind;
+enum { TIER_T0 = 0, TIER_T1 = 1 };
 
 typedef struct __attribute__((aligned(4))) {
     uint32_t hash_gen;          /* [31:8] = 24-bit hash, [7:0] = monotonic gen */
     uint16_t len;
-    uint8_t  kind;              /* LK_FREE (0) = empty, LK_OWNED (1) = live */
+    uint8_t  kind;              /* LK_FREE / LK_OWNED */
     uint8_t  chunk_id;
-    union { uint32_t offset; uintptr_t _ext; } u;
-    uint8_t  _pad[16];
+    uint32_t offset;
+    uint8_t  tier;              /* TIER_T0 / TIER_T1 — which arena */
+    uint8_t  _pad[19];
 } Entry;
-
 _Static_assert(sizeof(Entry) == 32, "Entry must be 32 bytes");
 
 typedef struct {
-    Entry            *headers;  /* M entries, indexed by slot position */
-    Arena             arena;
+    Entry            *headers;
+    Arena             t0;       /* transient — bulk-freed at epoch_end */
+    Arena             t1;       /* stable — freed at destroy */
     uint32_t          M;
-    uint16_t          pool_id;  /* even */
+    uint16_t          pool_id;
     uint64_t          seed;
+    uint64_t          fp_seed;  /* independent fold seed */
     _Atomic uint32_t  n_entries;
     _Atomic uint32_t  n_collisions;
-    _Atomic uint32_t  seq;      /* seqlock: odd during a write, even when stable */
+    _Atomic uint64_t  t0_fp;    /* e-mesh additive fold over live T0 strings */
+    _Atomic uint32_t  seq;
     uint32_t          max_entries;
     pthread_mutex_t   lock;
 } Pool;
 
 static inline const uint8_t *_entry_data(const Pool *p, const Entry *eh) {
-    return p->arena.chunks[eh->chunk_id]->data + eh->u.offset;
+    const Arena *a = eh->tier == TIER_T1 ? &p->t1 : &p->t0;
+    return a->chunks[eh->chunk_id]->data + eh->offset;
 }
 
 static inline bool _entry_matches(const Pool *p, const Entry *eh, const char *s, uint32_t len) {
     const uint8_t *ed = _entry_data(p, eh);
 #ifdef __AVX2__
-    /* safe: arena payloads are padded to 32-byte multiples */
     uint32_t i = 0;
     for (; i + 32 <= len; i += 32) {
         __m256i a = _mm256_loadu_si256((const __m256i *)(ed + i));
         __m256i b = _mm256_loadu_si256((const __m256i *)(s + i));
-        if (_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, b)) != 0xFFFFFFFF)
-            return false;
+        if (_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, b)) != 0xFFFFFFFF) return false;
     }
     if (i < len) {
         uint32_t rem = len - i;
@@ -245,15 +240,13 @@ static inline bool _entry_matches(const Pool *p, const Entry *eh, const char *s,
 #endif
 }
 
-/* publish header payload (word 1 = offset) then word 0 (hash_gen|len|kind|
- * chunk_id) LAST with release. __atomic_* builtins are used because Entry
- * is a plain struct; they are the standard GCC/clang atomics for
- * non-_Atomic storage. */
+/* publish word 1 (offset+tier) then word 0 (hash_gen|len|kind|chunk_id) LAST
+ * with release, so a lock-free reader that acquires word 0 sees word 1. */
 static inline void _store_header(Entry *dst, const Entry *src) {
     const uint64_t *s = (const uint64_t *)src;
     uint64_t *d = (uint64_t *)dst;
-    __atomic_store_n(d + 1, s[1], __ATOMIC_RELAXED);  /* u.offset */
-    __atomic_store_n(d,     s[0], __ATOMIC_RELEASE);  /* hash_gen|len|kind|chunk_id */
+    __atomic_store_n(d + 1, s[1], __ATOMIC_RELAXED);
+    __atomic_store_n(d,     s[0], __ATOMIC_RELEASE);
 }
 
 static Pool *pool_create(uint16_t pool_id, uint32_t expected, uint64_t seed) {
@@ -265,29 +258,33 @@ static Pool *pool_create(uint16_t pool_id, uint32_t expected, uint64_t seed) {
     p->headers = (Entry *)aligned_alloc(64, M * sizeof(Entry));
     assert(p->headers);
     p->M = M;
-    p->pool_id = pool_id;   /* parity matters: odd=short tier, even=long tier */
+    p->pool_id = pool_id;
     p->seed = seed;
+    p->fp_seed = seed ^ 0x9E3779B97F4A7C15ULL;
     p->max_entries = (uint32_t)(M * LONG_LOAD_NUM / LONG_LOAD_DEN);
     pthread_mutex_init(&p->lock, NULL);
     memset(p->headers, 0, M * sizeof(Entry));
 
-    uint32_t first_cap = expected * IP_AVG_STRLEN;
-    if (first_cap < IP_CHUNK_MIN) first_cap = IP_CHUNK_MIN;
-    p->arena.chunks[0] = _arena_chunk_new(first_cap);
-    p->arena.n_chunks = 1;
-    p->arena.cur_chunk = 0;
+    uint32_t cap = expected * IP_AVG_STRLEN;
+    if (cap < IP_CHUNK_MIN) cap = IP_CHUNK_MIN;
+    _arena_init(&p->t0, cap);
+    _arena_init(&p->t1, cap);
     return p;
 }
 
 static void pool_destroy(Pool *p) {
-    for (uint16_t i = 0; i < p->arena.n_chunks; i++) free(p->arena.chunks[i]);
+    _arena_free(&p->t0);
+    _arena_free(&p->t1);
     free(p->headers); free(p);
 }
 
-static SF_Handle pool_intern(Pool *p, const char *s, uint32_t len) {
+static inline uint64_t _entry_tier_bits(const Entry *eh) { return eh->tier == TIER_T1 ? IR_TIER_T1 : IR_TIER_T0; }
+
+static SF_Handle pool_intern(Pool *p, const char *s, uint32_t len, uint8_t tier) {
     uint64_t h = plumshash(s, len, p->seed);
     uint32_t h32 = (uint32_t)h;
     uint32_t pos = h32 & (p->M - 1);
+    Arena *a = tier == TIER_T1 ? &p->t1 : &p->t0;
 
     _lock(&p->lock);
     _seq_begin(&p->seq);
@@ -295,18 +292,18 @@ static SF_Handle pool_intern(Pool *p, const char *s, uint32_t len) {
     for (uint32_t probe = 0; probe < p->M; probe++) {
         uint32_t p2 = (pos + probe) & (p->M - 1);
         Entry *eh = &p->headers[p2];
-        uint64_t hdr = __atomic_load_n((uint64_t *)eh, __ATOMIC_RELAXED);  /* under lock */
+        uint64_t hdr = __atomic_load_n((uint64_t *)eh, __ATOMIC_RELAXED);
 
-        if (((uint8_t)(hdr >> 48)) == LK_FREE) {   /* empty slot */
+        if (((uint8_t)(hdr >> 48)) == LK_FREE) {
             uint8_t cid; uint32_t off;
-            _arena_alloc(&p->arena, len, &cid, &off);
-            uint8_t *dst = p->arena.chunks[cid]->data + off;
+            _arena_alloc(a, len, &cid, &off);
+            uint8_t *dst = a->chunks[cid]->data + off;
             memcpy(dst, s, len);
-            uint32_t padded = (len + 31) & ~31;   /* matches _arena_alloc's unit */
+            uint32_t padded = (len + 31) & ~31;
             if (padded == 0) padded = 32;
-            if (padded > len) memset(dst + len, 0, padded - len);  /* NUL-terminate */
+            if (padded > len) memset(dst + len, 0, padded - len);
 
-            uint8_t gen = (uint8_t)(hdr & 0xFF) + 1;   /* carry forward monotonic gen */
+            uint8_t gen = (uint8_t)(hdr & 0xFF) + 1;
             if (gen == 0) gen = 1;
 
             Entry ne = {0};
@@ -314,26 +311,28 @@ static SF_Handle pool_intern(Pool *p, const char *s, uint32_t len) {
             ne.len = (uint16_t)len;
             ne.kind = LK_OWNED;
             ne.chunk_id = cid;
-            ne.u.offset = off;
+            ne.offset = off;
+            ne.tier = tier;
             _store_header(eh, &ne);
+            if (tier == TIER_T0)
+                atomic_fetch_xor_explicit(&p->t0_fp, plumshash(s, len, p->fp_seed), memory_order_relaxed);
             atomic_fetch_add_explicit(&p->n_entries, 1, memory_order_relaxed);
-            out = _encode_handle(p2, gen, p->pool_id);
+            out = _encode_handle(p2, gen, p->pool_id, tier == TIER_T1 ? IR_TIER_T1 : IR_TIER_T0);
             break;
         }
 
-        /* occupied: dedup check */
         uint32_t hg = (uint32_t)hdr;
         uint16_t elen = (uint16_t)(hdr >> 32);
-        if (((hg ^ ((uint32_t)h32 << 8)) < 0x100u) && elen == len
+        if (eh->tier == tier && ((hg ^ ((uint32_t)h32 << 8)) < 0x100u) && elen == len
             && _entry_matches(p, eh, s, len)) {
-            out = _encode_handle(p2, (uint8_t)hg, p->pool_id);
+            out = _encode_handle(p2, (uint8_t)hg, p->pool_id, _entry_tier_bits(eh));
             break;
         }
         atomic_fetch_add_explicit(&p->n_collisions, 1, memory_order_relaxed);
     }
     _seq_end(&p->seq);
     _unlock(&p->lock);
-    return out;  /* SF_NULL if full */
+    return out;
 }
 
 static void pool_evict(Pool *p, SF_Handle h) {
@@ -345,9 +344,14 @@ static void pool_evict(Pool *p, SF_Handle h) {
     Entry *eh = &p->headers[pos];
     uint64_t hdr = __atomic_load_n((uint64_t *)eh, __ATOMIC_ACQUIRE);
     if (((uint8_t)(hdr >> 48)) == LK_OWNED && (uint8_t)hdr == gen) {
+        if (eh->tier == TIER_T0) {
+            const char *d = (const char *)_entry_data(p, eh);
+            uint16_t l = (uint16_t)(hdr >> 32);
+            atomic_fetch_xor_explicit(&p->t0_fp, plumshash(d, l, p->fp_seed), memory_order_relaxed);
+        }
         uint8_t ng = (uint8_t)(hdr & 0xFF) + 1; if (ng == 0) ng = 1;
-        uint64_t nhdr = (hdr & ~0xFFull) | ng;   /* bump gen */
-        nhdr &= ~(0xFFull << 48);                /* kind = LK_FREE */
+        uint64_t nhdr = (hdr & ~0xFFull) | ng;
+        nhdr &= ~(0xFFull << 48);
         __atomic_store_n((uint64_t *)eh, nhdr, __ATOMIC_RELEASE);
         atomic_fetch_sub_explicit(&p->n_entries, 1, memory_order_relaxed);
     }
@@ -355,9 +359,6 @@ static void pool_evict(Pool *p, SF_Handle h) {
     _unlock(&p->lock);
 }
 
-/* zero-copy: returns a pointer to IMMUTABLE arena bytes, valid for the
- * pool's lifetime; sets *len_out. A stale handle returns NULL. The seqlock
- * guarantees the {gen, len, offset} triple read here is consistent. */
 static const char *pool_str(Pool *p, SF_Handle h, uint32_t *len_out) {
     if (!_handle_valid(h) || _handle_pool(h) != p->pool_id) return NULL;
     uint32_t pos = _handle_rank(h);
@@ -367,22 +368,38 @@ static const char *pool_str(Pool *p, SF_Handle h, uint32_t *len_out) {
     uint32_t s0, s1;
     do {
         do { s0 = atomic_load_explicit(&p->seq, memory_order_acquire); }
-        while (s0 & 1);   /* writer in progress: retry */
+        while (s0 & 1);
         uint64_t hdr = __atomic_load_n((uint64_t *)eh, __ATOMIC_ACQUIRE);
-        if ((uint8_t)hdr != gen) return NULL;   /* stale handle */
-        data = (const char *)_entry_data(p, eh);  /* consistent within seqlock */
+        if ((uint8_t)hdr != gen) return NULL;
+        data = (const char *)_entry_data(p, eh);
         if (len_out) *len_out = (uint16_t)(hdr >> 32);
         s1 = atomic_load_explicit(&p->seq, memory_order_acquire);
     } while (s0 != s1);
     return data;
 }
 
+/* e-mesh epoch boundary: bulk-reclaim the T0 (transient) arena. The caller
+ * must have evicted every T0 entry first; the additive fingerprint verifies
+ * it — a nonzero fold means a live T0 entry would be reclaimed (a leak),
+ * which is reported and leaves the epoch uncommitted. */
+static int pool_epoch_end(Pool *p) {
+    uint64_t fp = atomic_load_explicit(&p->t0_fp, memory_order_acquire);
+    if (fp != 0) return 1;   /* live T0 entries remain: leak */
+    _lock(&p->lock);
+    _arena_free(&p->t0);
+    uint32_t cap = p->max_entries * IP_AVG_STRLEN;
+    if (cap < IP_CHUNK_MIN) cap = IP_CHUNK_MIN;
+    _arena_init(&p->t0, cap);
+    _unlock(&p->lock);
+    return 0;
+}
+
 /* ----------------------------------------------------------------------
- * HYBRID POOL — short tier + long tier, both arena-backed
+ * HYBRID POOL — short tier + long tier, each with T0/T1
  * ---------------------------------------------------------------------- */
 typedef struct {
-    Pool    *short_pool;   /* odd pool_id  */
-    Pool    *long_pool;    /* even pool_id */
+    Pool    *short_pool;
+    Pool    *long_pool;
     uint16_t base_pool_id;
 } HybridPool;
 
@@ -404,24 +421,34 @@ static void hybrid_destroy(HybridPool *hp) {
     free(hp);
 }
 
-static SF_Handle hybrid_intern(HybridPool *hp, const char *s, uint32_t len) {
-    if (len <= SHORT_MAX_LEN) {
-        SF_Handle h = pool_intern(hp->short_pool, s, len);
-        if (_handle_valid(h)) return h;
-    }
-    return pool_intern(hp->long_pool, s, len);
+static Pool *_tier_pool(HybridPool *hp, SF_Handle h) {
+    return (_handle_pool(h) & 1) ? hp->short_pool : hp->long_pool;
+}
+
+static SF_Handle hybrid_intern(HybridPool *hp, const char *s, uint32_t len) {       /* T0 */
+    Pool *p = (len <= SHORT_MAX_LEN) ? hp->short_pool : hp->long_pool;
+    return pool_intern(p, s, len, TIER_T0);
+}
+
+static SF_Handle hybrid_intern_stable(HybridPool *hp, const char *s, uint32_t len) {/* T1 */
+    Pool *p = (len <= SHORT_MAX_LEN) ? hp->short_pool : hp->long_pool;
+    return pool_intern(p, s, len, TIER_T1);
 }
 
 static void hybrid_evict(HybridPool *hp, SF_Handle h) {
     if (!_handle_valid(h)) return;
-    if (_handle_pool(h) & 1) pool_evict(hp->short_pool, h);
-    else                     pool_evict(hp->long_pool, h);
+    pool_evict(_tier_pool(hp, h), h);
 }
 
 static const char *hybrid_str(HybridPool *hp, SF_Handle h, uint32_t *len_out) {
     if (!_handle_valid(h)) return NULL;
-    if (_handle_pool(h) & 1) return pool_str(hp->short_pool, h, len_out);
-    else                     return pool_str(hp->long_pool, h, len_out);
+    return pool_str(_tier_pool(hp, h), h, len_out);
+}
+
+/* reclaim both pools' T0 arenas; returns nonzero if any live T0 entry
+ * remains (leak) */
+static int hybrid_epoch_end(HybridPool *hp) {
+    return pool_epoch_end(hp->short_pool) | pool_epoch_end(hp->long_pool);
 }
 
 /* ----------------------------------------------------------------------
@@ -430,6 +457,7 @@ static const char *hybrid_str(HybridPool *hp, SF_Handle h, uint32_t *len_out) {
 typedef struct {
     uint32_t short_entries, short_max;
     uint32_t long_entries, long_max, long_collisions;
+    uint64_t short_t0_fp, long_t0_fp;
     double   short_load, long_load;
 } HybridStats;
 
@@ -440,6 +468,8 @@ static HybridStats hybrid_stats(HybridPool *hp) {
     s.long_entries = atomic_load_explicit(&hp->long_pool->n_entries, memory_order_relaxed);
     s.long_max = hp->long_pool->M;
     s.long_collisions = atomic_load_explicit(&hp->long_pool->n_collisions, memory_order_relaxed);
+    s.short_t0_fp = atomic_load_explicit(&hp->short_pool->t0_fp, memory_order_relaxed);
+    s.long_t0_fp  = atomic_load_explicit(&hp->long_pool->t0_fp, memory_order_relaxed);
     s.short_load = (double)s.short_entries / s.short_max;
     s.long_load = (double)s.long_entries / s.long_max;
     return s;
@@ -449,17 +479,13 @@ static void hybrid_print_stats(HybridPool *hp) {
     HybridStats s = hybrid_stats(hp);
     fprintf(stderr,
         "[HybridPool id=%u]\n"
-        "  Short pool: %u / %u slots (%.1f%%)\n"
-        "  Long pool : %u / %u slots (%.1f%%), collisions=%u\n",
+        "  Short pool: %u / %u slots (%.1f%%), t0_fp=%016llx\n"
+        "  Long pool : %u / %u slots (%.1f%%), collisions=%u, t0_fp=%016llx\n",
         hp->base_pool_id,
-        s.short_entries, s.short_max, s.short_load * 100.0,
-        s.long_entries, s.long_max, s.long_load * 100.0,
-        s.long_collisions);
+        s.short_entries, s.short_max, s.short_load * 100.0, (unsigned long long)s.short_t0_fp,
+        s.long_entries, s.long_max, s.long_load * 100.0, s.long_collisions, (unsigned long long)s.long_t0_fp);
 }
 
-/* ----------------------------------------------------------------------
- * CLEANUP MACRO
- * ---------------------------------------------------------------------- */
 static inline void _hybrid_cleanup(HybridPool **hp) { if (*hp) { hybrid_destroy(*hp); *hp = NULL; } }
 #define HYBRID_SCOPED(name, id, short_n, long_n) \
     HybridPool *name __attribute__((cleanup(_hybrid_cleanup))) = hybrid_create((id), (short_n), (long_n))
