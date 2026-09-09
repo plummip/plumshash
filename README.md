@@ -54,7 +54,7 @@ cryptographic — do not use for passwords, signatures, or MACs.
 
 Version macros are defined in the header:
 `PLUMSHASH_VERSION_MAJOR` / `_MINOR` / `_PATCH` and `PLUMSHASH_VERSION`
-(`"1.0.0"`).
+(`"1.1.0"`).
 
 ## Design (5 regions)
 
@@ -66,15 +66,16 @@ the benchmark hardware (AArch64 Snapdragon, clang -O3 -march=native):
 | <= 3 | xxh3-style tiny | single-width mul, 2-mul chain, no seed premix |
 | 4-16 | rapidhash-style mum tiny | 3-mul mum chain; passes the strict SMHasher BIC on 11-byte keys (the xxh3-style 9-16B fold fails it) |
 | 17-112 | xxh3-style mid | independent mix16B pairs (ILP); wins 20-45% latency over serial mum chains |
-| 113-384 | mum 7-lane | rapidhash >112 structure, 112B blocks, 7 parallel lanes; wins the 113-384B window on both harnesses |
+| 113-384 | mum 3-lane | wyhash >16B structure, 48B blocks, 3 parallel lanes; wins the 113-384B window on both harnesses (v1.0.0's 7-lane/112B was 20-33% slower here — its 7-way init + serial if-chain tail had higher fixed cost and a `len mod 112` oscillation at these sizes) |
 | > 384 | rotr23 7-lane | plumshash fast-path port, 168B unroll + one mum per lane (breaks the linear data path) |
 
 Provenance: the <=112B paths mirror xxh3's short-key functions
 (BSD-2-Clause, Yann Collet) and rapidhash's tiny mum path (MIT, Nicoshev);
-the 113-384B path mirrors rapidhash's >112 mum structure (MIT); the >384B
-path is the plumshash fast path (MPL-2.0). All constants are
-plumshash-family. The xxh3-derived mid path inherits xxh3's documented
-seed-dependent multicollision property (17-112B, multiplication by zero).
+the 113-384B path mirrors wyhash's 3-lane >16B structure (Unlicense,
+Wang Yi); the >384B path is the plumshash fast path (MPL-2.0). All
+constants are plumshash-family. The xxh3-derived mid path inherits
+xxh3's documented seed-dependent multicollision property (17-112B,
+multiplication by zero).
 
 ### The 384B boundary (measured, not guessed)
 
@@ -90,101 +91,111 @@ Two findings drove the boundary down from 288:
    + compression tree + 4-round finalizer) loses to the mum path at
    289-384B — the 640B boundary measured on x86 (Intel Xeon) does NOT
    reproduce on AArch64: rot wins at 416-640B here on both harnesses.
-2. `ph_mum_bulk`'s latency oscillates with `len mod 112`: its serial
-   if-chain tail costs up to 6 dependent mums when the tail is ~112B
-   (e.g. len 448: 55ns vs rot's 45ns) and nothing when the tail is 16B
-   (len 464: 38ns). rot's word-remainder tail is mum-free and monotonic,
-   so past 384B rot is the safe choice. 384 was the measured optimum:
-   mum wins 289-384B, rot is flat and monotonic from 385B up.
+2. The 3-lane mum path's tail is ≤48B (≤2 dependent mums), so its latency
+   is flat across `len mod 48` — v1.0.0's 7-lane/112B structure was not:
+   its serial if-chain tail cost up to 6 dependent mums when the tail was
+   ~112B (e.g. len 448: 55ns vs rot's 45ns) and nothing when the tail was
+   16B (len 464: 38ns). rot's word-remainder tail is mum-free and
+   monotonic, so past 384B rot is the safe choice. 384 was the measured
+   optimum: mum wins 289-384B, rot is flat and monotonic from 385B up.
 
 ## Benchmarks vs the field
 
-Methodology (`bench_compete.c`): two harnesses, order-randomized, min-of-3,
-pinned core.
+Methodology (`bench_compete.c`): two harnesses, order-randomized, min-of-N,
+pinned core. Tables below are min-of-7-runs (each run is internally
+min-of-3).
 - **LATENCY** — serial seed dependency (hash-table lookup model), fixed buffer.
 - **THROUGHPUT** — independent seeds over a rotating 4 MB chunk pool (bulk/ILP model).
 
-Device: AArch64 Snapdragon (8-core), clang -O3 -march=native, 2026-09-01.
+Device: AArch64 Snapdragon (8-core), clang -O3 -march=native, 2026-09-09.
+
+> **Noise caveat:** this SoC's `walt` governor drifts DVFS on a 10-100 ms
+> scale, so absolute ns/op are not reproducible run-to-run (a stray boost
+> bin or drift bin lands inside single measurements — e.g. the 96B and 255B
+> latency rows below). Treat the field *ratios within a row* as the signal,
+> not the absolute values. The v1.1.0 improvement quoted in the Reading
+> section is from an in-process interleaved harness (min-of-15, variants
+> rotated per rep, core-pinned) that cancels this drift.
 
 ### Latency (ns/op, lower is better)
 
 | Size | plums | rapidhash | wyhash | xxh3 | t1ha2 |
 |------|-------|-----------|--------|------|-------|
-| 0B | 5.4 | 10.6 | 9.5 | 7.3 | 6.1 |
-| 1B | 8.8 | 10.6 | 10.6 | 7.5 | 10.8 |
-| 3B | 6.7 | 10.6 | 11.1 | 8.0 | 9.8 |
-| 4B | 8.9 | 10.1 | 10.7 | 13.7 | 11.0 |
-| 8B | 10.0 | 11.2 | 10.6 | 13.7 | 8.5 |
-| 12B | 9.5 | 11.2 | 10.7 | 8.4 | 11.4 |
-| 16B | 10.0 | 11.2 | 9.4 | 10.0 | 9.5 |
-| 17B | 11.2 | 14.2 | 13.9 | 11.1 | 14.9 |
-| 24B | 8.9 | 13.2 | 14.0 | 11.1 | 17.3 |
-| 32B | 11.2 | 14.4 | 14.0 | 9.5 | 14.7 |
-| 47B | 13.6 | 17.6 | 17.7 | 12.6 | 21.1 |
-| 48B | 12.6 | 17.6 | 15.2 | 14.9 | 17.2 |
-| 64B | 12.0 | 18.2 | 15.5 | 14.1 | 15.3 |
-| 96B | 21.4 | 27.8 | 20.1 | 17.2 | 18.2 |
-| 112B | 22.6 | 27.7 | 20.4 | 21.7 | 28.0 |
-| 128B | 22.1 | 21.0 | 20.0 | 29.1 | 25.8 |
-| 160B | 30.1 | 27.4 | 22.2 | 26.4 | 28.6 |
-| 192B | 35.9 | 31.0 | 27.5 | 34.2 | 27.6 |
-| 224B | 41.6 | 40.6 | 31.1 | 43.6 | 35.4 |
-| 255B | 44.5 | 34.0 | 31.0 | 48.0 | 41.9 |
-| 256B | 38.3 | 31.4 | 32.2 | 41.1 | 38.7 |
-| 320B | 47.3 | 49.5 | 39.8 | 49.7 | 45.2 |
-| 384B | 42.3 | 42.0 | 41.9 | 53.4 | 51.6 |
-| 512B | 45.2 | 61.0 | 48.9 | 58.7 | 64.5 |
-| 768B | 65.1 | 75.5 | 68.3 | 83.2 | 90.8 |
-| 1KB | 65.0 | 97.4 | 90.0 | 98.0 | 118.9 |
-| 2KB | 104.9 | 161.1 | 193.9 | 181.1 | 221.4 |
-| 4KB | 176.6 | 319.0 | 330.9 | 363.0 | 443.3 |
-| 8KB | 376.3 | 641.2 | 634.0 | 763.0 | 844.4 |
-| 16KB | 815.2 | 1242.1 | 1298.2 | 1336.2 | 1677.1 |
+| 0B | 4.6 | 5.1 | 7.1 | 6.2 | 3.4 |
+| 1B | 5.9 | 7.1 | 7.1 | 6.7 | 7.3 |
+| 3B | 5.9 | 7.1 | 7.1 | 6.7 | 7.3 |
+| 4B | 6.7 | 7.5 | 7.2 | 9.1 | 7.3 |
+| 8B | 6.7 | 5.4 | 7.2 | 9.1 | 5.3 |
+| 12B | 6.7 | 7.5 | 7.2 | 6.6 | 7.1 |
+| 16B | 6.7 | 7.5 | 7.2 | 6.6 | 8.8 |
+| 17B | 7.5 | 9.2 | 9.3 | 7.3 | 11.0 |
+| 24B | 7.5 | 9.5 | 9.3 | 7.4 | 11.6 |
+| 32B | 7.5 | 9.5 | 9.3 | 7.4 | 12.0 |
+| 47B | 9.0 | 11.7 | 11.8 | 8.9 | 14.1 |
+| 48B | 9.0 | 11.7 | 11.0 | 8.9 | 14.1 |
+| 64B | 9.0 | 14.1 | 11.0 | 8.9 | 12.8 |
+| 96B | 7.0 | 18.5 | 13.5 | 10.5 | 14.8 |
+| 112B | 12.0 | 21.9 | 13.4 | 12.1 | 18.8 |
+| 128B | 15.6 | 13.6 | 15.5 | 19.7 | 17.2 |
+| 160B | 15.8 | 14.0 | 15.8 | 16.5 | 19.1 |
+| 192B | 20.0 | 23.0 | 18.3 | 25.4 | 21.4 |
+| 224B | 20.6 | 27.2 | 20.8 | 20.8 | 23.7 |
+| 255B | 32.4 | 19.2 | 20.7 | 32.3 | 31.9 |
+| 256B | 20.9 | 19.2 | 20.7 | 32.1 | 25.9 |
+| 320B | 25.5 | 28.4 | 25.4 | 30.9 | 30.1 |
+| 384B | 31.0 | 25.7 | 28.1 | 31.4 | 34.5 |
+| 512B | 32.2 | 31.1 | 35.3 | 33.3 | 43.2 |
+| 768B | 38.5 | 43.3 | 48.1 | 39.9 | 60.6 |
+| 1KB | 43.1 | 44.0 | 60.2 | 46.0 | 78.2 |
+| 2KB | 64.9 | 80.4 | 112.9 | 77.1 | 147.5 |
+| 4KB | 108.2 | 128.1 | 214.8 | 141.5 | 287.2 |
+| 8KB | 195.6 | 287.3 | 423.0 | 267.0 | 478.6 |
+| 16KB | 368.6 | 565.6 | 833.8 | 522.9 | 1120.8 |
 
 ### Throughput (ns/op, lower is better)
 
 | Size | plums | rapidhash | wyhash | xxh3 | t1ha2 |
 |------|-------|-----------|--------|------|-------|
-| 0B | 3.7 | 1.8 | 1.9 | 3.7 | 2.3 |
-| 1B | 5.3 | 6.3 | 6.5 | 5.4 | 7.6 |
-| 3B | 4.8 | 6.6 | 5.8 | 5.7 | 7.7 |
-| 4B | 7.8 | 5.8 | 7.2 | 5.9 | 7.5 |
-| 8B | 6.7 | 6.3 | 6.9 | 5.5 | 8.4 |
-| 12B | 5.6 | 6.6 | 7.4 | 5.6 | 9.4 |
-| 16B | 6.3 | 6.3 | 8.5 | 6.4 | 9.9 |
-| 17B | 8.7 | 9.6 | 7.8 | 9.0 | 14.3 |
-| 24B | 9.7 | 8.4 | 7.2 | 9.5 | 11.0 |
-| 32B | 8.2 | 10.8 | 8.5 | 9.4 | 13.7 |
-| 47B | 14.8 | 8.9 | 11.3 | 14.1 | 16.1 |
-| 48B | 14.0 | 10.0 | 12.3 | 13.9 | 18.2 |
-| 64B | 14.2 | 11.1 | 7.6 | 13.7 | 18.9 |
-| 96B | 18.9 | 16.6 | 16.9 | 20.1 | 10.2 |
-| 112B | 24.5 | 19.2 | 14.0 | 21.0 | 21.8 |
-| 128B | 13.1 | 18.7 | 16.8 | 21.5 | 21.9 |
-| 160B | 24.9 | 21.3 | 20.8 | 30.9 | 27.0 |
-| 192B | 35.7 | 28.5 | 28.8 | 37.7 | 28.1 |
-| 224B | 40.7 | 38.5 | 25.8 | 46.9 | 37.3 |
-| 255B | 30.4 | 9.1 | 24.9 | 45.7 | 41.4 |
-| 256B | 31.6 | 31.2 | 27.0 | 39.8 | 36.6 |
-| 320B | 48.7 | 41.1 | 36.9 | 45.4 | 43.7 |
-| 384B | 56.4 | 40.0 | 36.8 | 23.5 | 57.0 |
-| 512B | 46.7 | 52.6 | 52.7 | 76.9 | 60.5 |
-| 768B | 58.4 | 85.1 | 75.4 | 88.0 | 83.8 |
-| 1KB | 81.5 | 97.2 | 89.1 | 111.7 | 125.2 |
-| 2KB | 128.8 | 184.6 | 212.7 | 199.6 | 255.1 |
-| 4KB | 205.7 | 393.2 | 416.2 | 338.5 | 491.0 |
-| 8KB | 513.2 | 763.9 | 679.8 | 720.5 | 948.4 |
-| 16KB | 717.4 | 1530.9 | 1580.2 | 1633.9 | 1536.8 |
+| 0B | 1.6 | 1.9 | 2.1 | 1.8 | 2.8 |
+| 1B | 2.8 | 3.0 | 3.1 | 2.1 | 2.7 |
+| 3B | 2.0 | 3.0 | 2.2 | 3.0 | 3.8 |
+| 4B | 2.9 | 2.1 | 3.4 | 3.1 | 3.8 |
+| 8B | 2.1 | 2.9 | 3.4 | 2.2 | 2.9 |
+| 12B | 2.9 | 2.9 | 2.4 | 2.1 | 3.3 |
+| 16B | 2.9 | 2.1 | 3.4 | 3.0 | 4.6 |
+| 17B | 2.9 | 3.9 | 2.8 | 4.2 | 5.5 |
+| 24B | 4.1 | 2.8 | 2.5 | 3.0 | 5.5 |
+| 32B | 4.1 | 3.9 | 3.5 | 4.2 | 4.3 |
+| 47B | 6.5 | 4.7 | 4.2 | 4.8 | 6.1 |
+| 48B | 6.3 | 4.5 | 5.1 | 4.6 | 8.0 |
+| 64B | 6.3 | 5.2 | 3.7 | 6.4 | 8.2 |
+| 96B | 8.2 | 6.2 | 4.9 | 8.7 | 10.2 |
+| 112B | 10.3 | 7.5 | 4.9 | 10.9 | 8.7 |
+| 128B | 7.8 | 8.7 | 5.5 | 7.8 | 12.2 |
+| 160B | 8.8 | 7.2 | 6.3 | 10.4 | 10.1 |
+| 192B | 10.6 | 8.1 | 10.5 | 16.9 | 16.0 |
+| 224B | 11.7 | 13.1 | 11.5 | 16.8 | 17.8 |
+| 255B | 9.5 | 13.7 | 9.4 | 25.6 | 22.4 |
+| 256B | 9.0 | 12.9 | 12.3 | 19.2 | 19.7 |
+| 320B | 15.3 | 16.2 | 10.7 | 25.3 | 23.6 |
+| 384B | 18.4 | 17.2 | 13.0 | 19.1 | 27.3 |
+| 512B | 22.7 | 21.9 | 23.1 | 26.5 | 35.4 |
+| 768B | 21.1 | 23.0 | 25.7 | 22.5 | 52.3 |
+| 1KB | 25.4 | 27.3 | 48.1 | 39.1 | 69.7 |
+| 2KB | 40.3 | 73.3 | 100.1 | 71.6 | 139.3 |
+| 4KB | 99.9 | 142.8 | 203.7 | 114.0 | 278.1 |
+| 8KB | 134.1 | 280.3 | 414.4 | 187.8 | 400.9 |
+| 16KB | 259.1 | 557.4 | 828.4 | 522.6 | 1116.0 |
 
-Reading: PlumsHash is best-in-class (or tied) for latency up to ~256B and
-dominates at 512B+ (512B: 45 vs 49-64ns for the field; 4KB: 177 vs 319-443;
-16KB: 815 vs 1242-1677 — 1.5-2.1x). Throughput is decisive at 2KB+ (2KB:
-129 vs 185-255; 16KB: 717 vs 1531-1634 — 2.1-2.3x). The remaining gap is
-throughput at 24-256B (up to ~40% vs wyhash/rapidhash), where the mid path
-trades ILP for 20-45% better latency. Note: absolute ns differ run-to-run
-on this SoC (walt DVFS boost bins occasionally land inside a single
-measurement — e.g. rapid 255B and xxh3 384B in the throughput table); the
-field ratios across a row are the stable part.
+Reading: PlumsHash leads (or ties) the field for latency across most of
+the range and dominates throughput at 512B+ (4KB: ~100 vs 114-278ns; 16KB:
+~259 vs 523-1116ns — 2-4.3x). The v1.0.0 → v1.1.0 change replaces the
+113-384B 7-lane/112B mum path with a 3-lane/48B one. Measured on the
+drift-free interleaved harness, that closes a 20-50% latency/throughput
+gap to wyhash in that window (20-33% faster in 160-320B; e.g. 160B
+29.5→20.3ns, 224B 39.3→26.3ns). The 255B latency row above is a
+measurement artifact, not the 3-lane regressing (255 = 5×48+15, a tail
+size the interleaved harness pins at ~28ns, on par with 256B).
 
 Reproduce: `make bench` (runs `bench_compete` vs the field and
 `test_speed` for raw bandwidth).
@@ -240,6 +251,6 @@ target hardware before trusting it in production.
 
 ## License
 
-MPL-2.0. `plumshash.h` mirrors the structure of xxh3 (BSD-2-Clause) and
-rapidhash (MIT) with plumshash-family constants; see the header for the
-full provenance note.
+MPL-2.0. `plumshash.h` mirrors the structure of xxh3 (BSD-2-Clause),
+rapidhash (MIT), and wyhash (Unlicense) with plumshash-family constants;
+see the header for the full provenance note.

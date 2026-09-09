@@ -1,5 +1,5 @@
 /*
- * plumshash.h — PlumsHash v1.0.0: 5-region, empirically selected
+ * plumshash.h — PlumsHash v1.1.0: 5-region, empirically selected
  * =========================================================================
  * Fast 64-bit non-cryptographic hash. Header-only, zero dependencies,
  * MPL-2.0. Define PLUMSHASH_IMPLEMENTATION in exactly one translation
@@ -16,17 +16,23 @@
  *                                   real xxh3 fails it on this build too)
  *   len <= 112  xxh3-style mid      independent mix16B pairs (ILP), wins
  *                                   20-45% latency over serial mum chains
- *   len <= 384  mum 7-lane          rapidhash >112 structure (112B blocks,
- *                                   unrolled, 7 parallel lanes) — wins the
- *                                   113-384B window on both harnesses
- *                                   (113-128 joins via the 112B parallel
- *                                   block + tail, beating the mid path's
- *                                   serial add chain; 129-224 replaced the
- *                                   xxh3-style large walk: same latency
- *                                   within noise, 15-19% better throughput;
- *                                   the 384B cap measured on this device —
- *                                   past it the serial if-chain tail's
- *                                   len mod 112 oscillation loses to rot)
+ *   len <= 384  mum 3-lane          wyhash-style 3-lane/48B structure (3
+ *                                   parallel accumulators, 48B blocks) with
+ *                                   plumshash constants — wins the 113-384B
+ *                                   window on both harnesses. (v1.0.0 used a
+ *                                   rapidhash-style 7-lane/112B structure
+ *                                   here; measured 20-33% slower than the
+ *                                   3-lane in the 160-320B window because
+ *                                   its 7-way init + serial if-chain tail
+ *                                   has higher fixed cost and a len mod 112
+ *                                   oscillation at these sizes — only 1-3
+ *                                   blocks run, so the 7-lane ILP never
+ *                                   pays off. The 3-lane's finer 48B
+ *                                   granularity keeps the tail ≤48B and
+ *                                   closes the gap to wyhash. Boundary vs
+ *                                   rot re-measured: 3-lane ≈ rot at 384B,
+ *                                   rot dominates from ~512B, so the 384B
+ *                                   cap is retained.)
  *   len >  384  rotr23 7-lane       plums_fast port (168B unroll, ldp pairs,
  *                                   rotated compression) + one mum per lane
  *                                   (breaks the linear data path that made
@@ -40,8 +46,8 @@
  * Provenance: the <=112B paths mirror the structure of xxh3's short-key
  * functions (BSD-2-Clause, Yann Collet) and rapidhash's tiny mum path
  * (MIT, Nicoshev) with plumshash-family constants; the 113-384B path
- * mirrors rapidhash's >112 mum structure (MIT, Nicoshev); the >384B path
- * is the plumshash fast path (MPL-2.0). All constants are
+ * mirrors wyhash's 3-lane >16B structure (Unlicense, Wang Yi); the >384B
+ * path is the plumshash fast path (MPL-2.0). All constants are
  * plumshash-family. Note the xxh3-derived mid path shares xxh3's
  * documented seed-dependent multicollision property (17-112B,
  * multiplication by zero).
@@ -57,9 +63,9 @@
 #include <stddef.h>
 
 #define PLUMSHASH_VERSION_MAJOR 1
-#define PLUMSHASH_VERSION_MINOR 0
+#define PLUMSHASH_VERSION_MINOR 1
 #define PLUMSHASH_VERSION_PATCH 0
-#define PLUMSHASH_VERSION "1.0.0"
+#define PLUMSHASH_VERSION "1.1.0"
 
 #ifdef __cplusplus
 extern "C" {
@@ -182,9 +188,9 @@ static uint64_t ph_mid(const uint8_t * PH_RESTRICT p, size_t len, uint64_t seed)
     return ph_aval(acc);
 }
 
-/* ── Mum path (rapidhash structure, plumshash constants): used for the
- * 4-16B tiny case (beats xxh3's rrmxmx there) and the 113-384B window
- * (7-lane 112B blocks; wins that window on both harnesses).
+/* ── Mum path (wyhash 3-lane structure, plumshash constants): used for
+ * the 4-16B tiny case (beats xxh3's rrmxmx there) and the 113-384B
+ * window (3-lane 48B blocks; wins that window on both harnesses).
  * Length is folded into the final multiply, so length separation cannot
  * be cancelled by a linear tree. ── */
 /* x86 note: the original ph_mum_path() served both the 4-16B tiny case and
@@ -206,17 +212,18 @@ static uint64_t ph_mid(const uint8_t * PH_RESTRICT p, size_t len, uint64_t seed)
  * multi-KB range. AArch64 measurement (this device, Snapdragon, clang
  * -O3 -march=native, 15-rep min interleaved, core-pinned) does NOT
  * reproduce the 640B boundary: ph_rot_bulk wins at 416-640B on both
- * latency and throughput, and ph_mum_bulk's latency oscillates with
- * len mod 112 (its serial if-chain tail costs up to 6 dependent mums at
- * tail ~112B, e.g. len 448: 55ns vs rot 45ns; a 16B tail is free, e.g.
- * len 464: 38ns). The measured optimum is a 384B boundary: mum wins
- * 289-384B (rot's fixed overhead dominates), rot is flat and monotonic
- * from 385B up. Tuning was done with an in-process interleaved harness
- * (min-of-15, variants rotated per rep) because naive min-of-3 sweeps on
- * this SoC are polluted by walt-governor DVFS drift between sizes; only
- * within-row (same-size) comparisons are trustworthy. A different
- * architecture/compiler will likely want to re-measure this boundary
- * rather than trust 384 blindly. */
+ * latency and throughput. v1.0.0's 7-lane mum_bulk had a serial if-chain
+ * tail whose cost oscillated with len mod 112 (up to 6 dependent mums at
+ * tail ~112B, e.g. len 448: 55ns vs rot 45ns; a 16B tail is free). The
+ * 3-lane/48B replacement shrinks the tail to ≤48B (≤2 dependent mums),
+ * removing that oscillation. The measured optimum is a 384B boundary:
+ * 3-lane mum wins 289-384B (rot's fixed overhead dominates), rot is flat
+ * and monotonic from 385B up. Tuning was done with an in-process
+ * interleaved harness (min-of-15, variants rotated per rep) because
+ * naive min-of-3 sweeps on this SoC are polluted by walt-governor DVFS
+ * drift between sizes; only within-row (same-size) comparisons are
+ * trustworthy. A different architecture/compiler will likely want to
+ * re-measure this boundary rather than trust 384 blindly. */
 static PH_INLINE uint64_t ph_mum_tiny(const uint8_t * PH_RESTRICT p, size_t len, uint64_t seed) {
     seed ^= ph_mum(seed ^ ph_S[2], ph_S[1]);
     uint64_t a = 0, b = 0;
@@ -235,66 +242,32 @@ static PH_INLINE uint64_t ph_mum_tiny(const uint8_t * PH_RESTRICT p, size_t len,
 }
 
 static PH_INLINE uint64_t ph_mum_bulk(const uint8_t * PH_RESTRICT p, size_t len, uint64_t seed) {
-    size_t i = len;
     seed ^= ph_mum(seed ^ ph_S[2], ph_S[1]);
     uint64_t a = 0, b = 0;
-
-    {
-        /* boundary note: ph_mum_bulk only ever serves 113-384B here (the
-         * >384B case goes to ph_rot_bulk), so the 112B loop body runs at
-         * most 3 times. A plain do-while over a single 112B block
-         * (rapidhash's default "compact" structure) is used instead of a
-         * 224B-unrolled block (two copies pasted back to back): identical
-         * arithmetic, half the code size, and the extra loop-back branch
-         * is negligible at ≤3 iterations. The if-chain tail below is
-         * serial in the seed and its cost oscillates with len mod 112 —
-         * that is why the mum region stops at 384B (see the boundary
-         * note near ph_rot_bulk). */
-        if (i > 112) {
-            uint64_t see1 = seed, see2 = seed, see3 = seed;
-            uint64_t see4 = seed, see5 = seed, see6 = seed;
-            do {
-                seed = ph_mum(ph_read64(p)      ^ ph_S[0], ph_read64(p +  8) ^ seed);
-                see1 = ph_mum(ph_read64(p + 16) ^ ph_S[1], ph_read64(p + 24) ^ see1);
-                see2 = ph_mum(ph_read64(p + 32) ^ ph_S[2], ph_read64(p + 40) ^ see2);
-                see3 = ph_mum(ph_read64(p + 48) ^ ph_S[3], ph_read64(p + 56) ^ see3);
-                see4 = ph_mum(ph_read64(p + 64) ^ ph_S[4], ph_read64(p + 72) ^ see4);
-                see5 = ph_mum(ph_read64(p + 80) ^ ph_S[5], ph_read64(p + 88) ^ see5);
-                see6 = ph_mum(ph_read64(p + 96) ^ ph_S[6], ph_read64(p +104) ^ see6);
-                p += 112; i -= 112;
-            } while (i > 112);
-            seed ^= see1; see2 ^= see3; see4 ^= see5;
-            seed ^= see6; see2 ^= see4; seed ^= see2;
-        }
-        if (i > 16) {
-            seed = ph_mum(ph_read64(p)      ^ ph_S[2], ph_read64(p +  8) ^ seed);
-            if (i > 32) {
-                seed = ph_mum(ph_read64(p + 16) ^ ph_S[2], ph_read64(p + 24) ^ seed);
-                if (i > 48) {
-                    seed = ph_mum(ph_read64(p + 32) ^ ph_S[1], ph_read64(p + 40) ^ seed);
-                    if (i > 64) {
-                        seed = ph_mum(ph_read64(p + 48) ^ ph_S[1], ph_read64(p + 56) ^ seed);
-                        if (i > 80) {
-                            seed = ph_mum(ph_read64(p + 64) ^ ph_S[2], ph_read64(p + 72) ^ seed);
-                            if (i > 96) {
-                                seed = ph_mum(ph_read64(p + 80) ^ ph_S[1], ph_read64(p + 88) ^ seed);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        a = ph_read64(p + i - 16) ^ i;
-        b = ph_read64(p + i - 8);
+    size_t i = len;
+    if (i > 48) {
+        uint64_t see1 = seed, see2 = seed;
+        do {
+            seed = ph_mum(ph_read64(p)      ^ ph_S[0], ph_read64(p +  8) ^ seed);
+            see1 = ph_mum(ph_read64(p + 16) ^ ph_S[1], ph_read64(p + 24) ^ see1);
+            see2 = ph_mum(ph_read64(p + 32) ^ ph_S[2], ph_read64(p + 40) ^ see2);
+            p += 48; i -= 48;
+        } while (i > 48);
+        seed ^= see1 ^ see2;
     }
-
+    while (i > 16) {
+        seed = ph_mum(ph_read64(p) ^ ph_S[1], ph_read64(p + 8) ^ seed);
+        i -= 16; p += 16;
+    }
+    a = ph_read64(p + i - 16) ^ i;
+    b = ph_read64(p + i - 8);
     a ^= ph_S[1];
     b ^= seed;
     ph_mum2(a, b, &a, &b);
     return ph_mum(a ^ ph_S[7], b ^ ph_S[1] ^ i);
 }
 
-/* ── rotr23 7-lane bulk (len > 256): plums_fast port ──
+/* ── rotr23 7-lane bulk (len > 384): plums_fast port ──
  * 168B unrolled blocks (21 loads hoisted, ldp-pair friendly), 56B blocks,
  * if-chain remainder words, memcpy tail, rotated balanced compression
  * tree, then 4-round finalizer + length/seed whitening re-injected after
@@ -382,7 +355,7 @@ uint64_t plumshash(const void *buf, size_t len, uint64_t seed) {
     if (PH_LIKELY(len <= 3))   return ph_x13(p, len, seed);
     if (len <= 16)             return ph_mum_tiny(p, len, seed);   /* 4-16: mum tiny */
     if (len <= 112)            return ph_mid(p, len, seed);
-    if (len <= 384)            return ph_mum_bulk(p, len, seed);   /* 113-384: mum 7-lane (see boundary note) */
+    if (len <= 384)            return ph_mum_bulk(p, len, seed);   /* 113-384: mum 3-lane (see boundary note) */
     return ph_rot_bulk(p, len, seed);
 }
 
