@@ -1,57 +1,43 @@
 /*
- * hybrid_intern.h — lock-free-read, write-serialized hybrid intern pool
+ * hybrid_intern.h — lock-free-read, write-serialized intern pool
  *                   built on PlumsHash.
  * =========================================================================
  * A string-interning structure with two tiers:
- *   - Short pool: strings <= SHORT_MAX_LEN stored inline in 64-byte slots
- *     (no heap allocation on the hot path).
- *   - Long pool : longer strings in a bump-allocated chunk arena, indexed
- *     by a lock-serialized bitmap + rank structure.
+ *   - Short pool: strings <= SHORT_MAX_LEN (typically identifiers) in a
+ *     smaller, hotter pool.
+ *   - Long pool : longer strings in a larger pool.
  *
- * Handles are NaN-boxed 64-bit values: {rank(28) | gen(8) | pool(13) | tier}.
+ * Both tiers store string bytes in an IMMUTABLE bump-allocated arena and
+ * index them by slot position, so str() returns a raw pointer (zero-copy)
+ * that stays valid for the pool's lifetime — an evicted entry's bytes are
+ * never freed or overwritten (the arena is released only at pool destroy).
+ *
+ * Handles are NaN-boxed 64-bit values: {pos(28) | gen(8) | pool(13) | tier}.
  * They are valid NaNs, so they can live inside a double in a tagged-union
  * language runtime without a separate discriminant word.
  *
  * CONCURRENCY MODEL
  * -----------------
- *   - Reads  (str lookup) are LOCK-FREE: a single acquire load of the
- *     slot/header's publish word orders the data payload.
- *   - Writes (intern / evict) are serialized by a per-pool spinlock.
+ *   - Reads  (str lookup) are LOCK-FREE: a per-pool seqlock makes each read
+ *     a consistent snapshot, so a concurrent evict+re-intern can only yield
+ *     the intact old string (gen still matched) or NULL (stale) — never a
+ *     torn {gen, offset} pair. The returned pointer is to immutable arena
+ *     bytes, so it never dangles.
+ *   - Writes (intern / evict) are serialized by a per-pool pthread mutex.
  *
- * Why not fully lock-free? A fixed-size inline slot holds a 48-byte string,
- * which cannot be published atomically with a single CAS. The original
- * (lock-free CAS) design had two publication races: it published the
- * slot/bit *before* writing the payload, so a concurrent reader could see
- * a live slot with torn data, and a concurrent intern of the same string
- * produced a duplicate handle. The seqlock on the long pool's bitmap did
- * not protect the header because the bit was claimed outside its window.
- * This rewrite serializes writers (spinlock) and publishes the payload
- * *last* behind a release store; readers acquire that store, so they see a
- * consistent entry. Interning is rare relative to lookup, so the locked
- * write path costs almost nothing.
- *
- * THREAD-SAFETY & LIFETIME
- * ------------------------
- *   str() COPIES the string into a caller buffer (never returns a raw pool
- *   pointer). A per-pool seqlock makes each copy a consistent snapshot, so
- *   an evict+re-intern racing a lookup can only yield the intact old string
- *   (gen still matched) or 0 (stale) — never torn data. Handles are
- *   gen-tagged and monotonic; a stale handle resolves to length 0. This
- *   removes the evict-during-lookup TOCTOU that raw-pointer reads had.
- *   Strings themselves are immutable in the long pool (bump allocator never
- *   frees); the short pool's inline bytes are re-copied under the seqlock.
+ * Why not fully lock-free? A fixed-size slot holds {hash, gen, len, chunk,
+ * offset} that cannot be published atomically with one CAS. Serializing
+ * writers (mutex) + publishing payload-last behind the seqlock makes reads
+ * lock-free and consistent. Interning is rare relative to lookup.
  *
  * PORTABILITY
  * -----------
  *   - No AVX2 requirement: the vectorized compare is used only under
- *     __AVX2__ (x86-64 -mavx2); everywhere else (incl. AArch64) memcmp is
- *     used. The x86 AVX2 path is safe because long-pool payloads are
- *     padded to 32-byte multiples; the short pool always uses memcmp
- *     (its 48-byte inline buffer is not 32-byte padded, so a masked AVX2
- *     tail would over-read).
- *   - Handles are NaN-boxed; this is portable to every AArch64/x86-64
- *     compiler that preserves IEEE-754 NaN payloads (all of them in
- *     practice). The payload bits (rank/gen/pool) never touch bits 63:52.
+ *     __AVX2__ (x86-64 -mavx2); elsewhere (incl. AArch64) memcmp is used.
+ *     The AVX2 path is safe because arena payloads are padded to 32-byte
+ *     multiples.
+ *   - Handles are NaN-boxed; portable to every AArch64/x86-64 compiler that
+ *     preserves IEEE-754 NaN payloads.
  *
  * Use:
  *   #define PLUMSHASH_IMPLEMENTATION   // in exactly one .c file
@@ -84,10 +70,7 @@
  * TUNING
  * ---------------------------------------------------------------------- */
 #ifndef SHORT_MAX_LEN
-# define SHORT_MAX_LEN 48        /* bytes stored inline */
-#endif
-#ifndef SHORT_LOAD_FACTOR
-# define SHORT_LOAD_FACTOR 0.75f
+# define SHORT_MAX_LEN 48
 #endif
 #ifndef LONG_LOAD_NUM
 # define LONG_LOAD_NUM 3
@@ -128,19 +111,14 @@ static inline uint16_t _handle_pool(SF_Handle h) { return (uint16_t)((h.u >> IR_
 static inline bool     _handle_valid(SF_Handle h) { return (h.u & 0x7FF0000000000000ULL) == IR_NAN; }
 
 /* ----------------------------------------------------------------------
- * Write lock (writers only). A pthread mutex rather than a spinlock: under
- * contention the kernel deschedules waiters instead of burning CPU, which
- * avoids the thundering-herd that a test-and-set spinlock hits on shared
- * or preempted cores. Reads stay lock-free and never touch this lock.
+ * Write lock + seqlock
  * ---------------------------------------------------------------------- */
 static inline void _lock(pthread_mutex_t *m) { pthread_mutex_lock(m); }
 static inline void _unlock(pthread_mutex_t *m) { pthread_mutex_unlock(m); }
 
-/* Seqlock (reader/writer): writers are already serialized by the pool
- * mutex; they bump seq odd before mutating and even after. A reader copies
- * out only across a stable (even, unchanged) seq, so it can never observe a
- * torn entry — this closes the evict-during-lookup TOCTOU that raw-pointer
- * reads had. */
+/* Seqlock: writers (already serialized by the mutex) bump seq odd before
+ * mutating and even after. A reader copies out only across a stable (even,
+ * unchanged) seq, so it never observes a torn {gen, offset} pair. */
 static inline void _seq_begin(_Atomic uint32_t *s) { atomic_fetch_add_explicit(s, 1, memory_order_release); }
 static inline void _seq_end  (_Atomic uint32_t *s) { atomic_fetch_add_explicit(s, 1, memory_order_release); }
 
@@ -153,7 +131,6 @@ static uint64_t _entropy(void) {
     if (getrandom(&s, sizeof(s), 0) != (ssize_t)sizeof(s))
 #endif
     {
-        /* fallback: ASLR address + wall clock, mixed */
         s = (uint64_t)(uintptr_t)&s;
         s ^= (uint64_t)time(NULL) * 0x9E3779B97F4A7C15ULL;
     }
@@ -161,145 +138,8 @@ static uint64_t _entropy(void) {
 }
 
 /* ----------------------------------------------------------------------
- * SHORT POOL — 64-byte inline slots
+ * IMMUTABLE ARENA — bump-allocated chunks, never freed until pool destroy
  * ---------------------------------------------------------------------- */
-typedef struct __attribute__((aligned(64))) {
-    _Atomic uint64_t hash_gen;  /* [63:8] = 32-bit hash, [7:0] = gen (monotonic) */
-    _Atomic uint32_t len;
-    _Atomic uint8_t  live;      /* 0 = empty, 1 = occupied; published LAST */
-    uint8_t          _pad[3];
-    char             data[SHORT_MAX_LEN];
-} ShortSlot;
-
-_Static_assert(sizeof(ShortSlot) == 64, "ShortSlot must be 64 bytes");
-
-typedef struct {
-    ShortSlot        *slots;
-    uint32_t          M;        /* power of two */
-    uint32_t          max_entries;
-    uint16_t          pool_id;  /* odd */
-    uint64_t          seed;
-    _Atomic uint32_t  n_entries;
-    _Atomic uint32_t  seq;      /* seqlock: odd during a write, even when stable */
-    pthread_mutex_t   lock;
-} ShortPool;
-
-static ShortPool *short_pool_create(uint16_t pool_id, uint32_t expected, uint64_t seed) {
-    if (expected < 64) expected = 64;
-    uint32_t M = 1;
-    while (M < (uint32_t)(expected / SHORT_LOAD_FACTOR)) M <<= 1;
-    ShortPool *sp = (ShortPool *)calloc(1, sizeof(ShortPool));
-    sp->slots = (ShortSlot *)aligned_alloc(64, M * sizeof(ShortSlot));
-    assert(sp->slots);
-    sp->M = M;
-    sp->max_entries = (uint32_t)(M * SHORT_LOAD_FACTOR);
-    sp->pool_id = pool_id | 1;
-    sp->seed = seed;
-    pthread_mutex_init(&sp->lock, NULL);
-    memset(sp->slots, 0, M * sizeof(ShortSlot));
-    return sp;
-}
-
-static void short_pool_destroy(ShortPool *sp) { free(sp->slots); free(sp); }
-
-static inline bool _short_slot_match(const ShortSlot *slot, const char *s, uint32_t len) {
-    /* memcmp on <=48 bytes: the compiler vectorizes this; the AVX2 path is
-     * unsafe here because the 48-byte buffer is not 32-byte padded. */
-    return memcmp(slot->data, s, len) == 0;
-}
-
-static SF_Handle short_intern(ShortPool *sp, const char *s, uint32_t len) {
-    if (len > SHORT_MAX_LEN) return SF_NULL;
-
-    uint64_t h = plumshash(s, len, sp->seed);
-    uint32_t h32 = (uint32_t)h;
-    uint32_t pos = h32 & (sp->M - 1);
-
-    _lock(&sp->lock);
-    _seq_begin(&sp->seq);
-    SF_Handle out = SF_NULL;
-    for (uint32_t probe = 0; probe < sp->M; probe++) {
-        uint32_t p = (pos + probe) & (sp->M - 1);
-        ShortSlot *slot = &sp->slots[p];
-
-        if (atomic_load_explicit(&slot->live, memory_order_relaxed)) {
-            uint64_t hg = atomic_load_explicit(&slot->hash_gen, memory_order_relaxed);
-            if ((hg >> 8) == h32
-                && atomic_load_explicit(&slot->len, memory_order_relaxed) == len
-                && _short_slot_match(slot, s, len)) {
-                out = _encode_handle(p, (uint8_t)hg, sp->pool_id);
-                break;
-            }
-            continue;  /* occupied by a different string: probe */
-        }
-
-        /* empty slot: write payload, then publish 'live' LAST */
-        uint8_t gen = (uint8_t)(atomic_load_explicit(&slot->hash_gen, memory_order_relaxed) & 0xFF) + 1;
-        if (gen == 0) gen = 1;
-        atomic_store_explicit(&slot->len, len, memory_order_relaxed);
-        memcpy(slot->data, s, len);
-        if (len < SHORT_MAX_LEN) memset(slot->data + len, 0, SHORT_MAX_LEN - len);
-        atomic_store_explicit(&slot->hash_gen, ((uint64_t)h32 << 8) | gen, memory_order_relaxed);
-        atomic_store_explicit(&slot->live, 1, memory_order_release);  /* publish */
-        atomic_fetch_add_explicit(&sp->n_entries, 1, memory_order_relaxed);
-        out = _encode_handle(p, gen, sp->pool_id);
-        break;
-    }
-    _seq_end(&sp->seq);
-    _unlock(&sp->lock);
-    return out;  /* SF_NULL if full */
-}
-
-static void short_evict(ShortPool *sp, SF_Handle h) {
-    if (!_handle_valid(h) || _handle_pool(h) != sp->pool_id) return;
-    uint32_t rank = _handle_rank(h);
-    uint8_t  gen  = _handle_gen(h);
-    _lock(&sp->lock);
-    _seq_begin(&sp->seq);
-    ShortSlot *slot = &sp->slots[rank];
-    if (atomic_load_explicit(&slot->live, memory_order_relaxed)
-        && (uint8_t)(atomic_load_explicit(&slot->hash_gen, memory_order_relaxed) & 0xFF) == gen) {
-        uint8_t ng = gen + 1; if (ng == 0) ng = 1;
-        atomic_fetch_and_explicit(&slot->hash_gen, ~0xFFull, memory_order_relaxed);
-        atomic_fetch_or_explicit(&slot->hash_gen, ng, memory_order_relaxed);   /* bump gen */
-        atomic_store_explicit(&slot->live, 0, memory_order_release);          /* publish */
-        atomic_fetch_sub_explicit(&sp->n_entries, 1, memory_order_relaxed);
-    }
-    _seq_end(&sp->seq);
-    _unlock(&sp->lock);
-}
-
-static uint32_t short_str(ShortPool *sp, SF_Handle h, char *buf, uint32_t bufcap) {
-    if (!_handle_valid(h) || _handle_pool(h) != sp->pool_id) return 0;
-    uint32_t rank = _handle_rank(h);
-    uint8_t  gen  = _handle_gen(h);
-    ShortSlot *slot = &sp->slots[rank];
-    uint32_t s0, s1, len;
-    do {
-        do { s0 = atomic_load_explicit(&sp->seq, memory_order_acquire); }
-        while (s0 & 1);   /* writer in progress: retry */
-        uint64_t hg = atomic_load_explicit(&slot->hash_gen, memory_order_acquire);
-        if ((uint8_t)hg != gen) return 0;   /* stale handle */
-        len = atomic_load_explicit(&slot->len, memory_order_relaxed);
-        if (len > bufcap) return 0;
-        memcpy(buf, slot->data, len);
-        s1 = atomic_load_explicit(&sp->seq, memory_order_acquire);
-    } while (s0 != s1);
-    return len;
-}
-
-/* ----------------------------------------------------------------------
- * LONG POOL — slot-indexed headers + chunk arena
- * ----------------------------------------------------------------------
- * Each slot has a fixed header at headers[pos]; occupancy is encoded in the
- * header's `kind` byte. The original design used a bitmap + "rank = popcount
- * of bits before pos" compact index, which is unsound for arbitrary-order
- * insertion: inserting at a lower position after a higher one would need to
- * shift every later header, and the insert path never did — so a lower
- * insert silently overwrote a higher entry. Fixed slot indexing is trivially
- * correct; the bitmap only bought cache-friendly probing, which the header's
- * own occupancy byte provides anyway.
- */
 typedef struct DataChunk {
     struct DataChunk  *next;
     uint32_t           cap;
@@ -310,35 +150,13 @@ typedef struct DataChunk {
 
 _Static_assert(sizeof(DataChunk) == 64, "DataChunk must be 64 bytes");
 
-typedef enum : uint8_t { LK_FREE = 0, LK_OWNED = 1 } LongKind;
-
-typedef struct __attribute__((aligned(4))) {
-    uint32_t hash_gen;          /* [31:8] = 24-bit hash, [7:0] = monotonic gen */
-    uint16_t len;
-    uint8_t  kind;              /* LK_FREE (0) = empty, LK_OWNED (1) = live */
-    uint8_t  chunk_id;
-    union { uint32_t offset; uintptr_t _ext; } u;
-    uint8_t  _pad[16];
-} LongEntry;
-
-_Static_assert(sizeof(LongEntry) == 32, "LongEntry must be 32 bytes");
-
 typedef struct {
-    LongEntry       *headers;   /* M entries, indexed by slot position */
-    DataChunk       *chunks[LONG_MAX_CHUNKS];
-    uint32_t         M;
-    uint16_t         pool_id;   /* even */
-    uint16_t         n_chunks;
-    uint8_t          cur_chunk;
-    uint64_t         seed;
-    _Atomic uint32_t n_entries;
-    _Atomic uint32_t n_collisions;
-    _Atomic uint32_t seq;       /* seqlock: odd during a write, even when stable */
-    uint32_t         max_entries;
-    pthread_mutex_t  lock;
-} LongPool;
+    DataChunk *chunks[LONG_MAX_CHUNKS];
+    uint16_t   n_chunks;
+    uint8_t    cur_chunk;
+} Arena;
 
-static DataChunk *_long_chunk_new(uint32_t cap) {
+static DataChunk *_arena_chunk_new(uint32_t cap) {
     cap = (cap + 31) & ~31;
     DataChunk *c = (DataChunk *)malloc(sizeof(DataChunk) + cap);
     assert(c);
@@ -349,35 +167,63 @@ static DataChunk *_long_chunk_new(uint32_t cap) {
 }
 
 /* writer-side only (called under the pool lock) */
-static void _long_chunk_alloc(LongPool *p, uint32_t len, uint8_t *cid_out, uint32_t *off_out) {
+static void _arena_alloc(Arena *a, uint32_t len, uint8_t *cid_out, uint32_t *off_out) {
     uint32_t need = (len + 31) & ~31;
     if (!need) need = 32;
-    uint8_t cid = p->cur_chunk;
-    DataChunk *cur = p->chunks[cid];
+    uint8_t cid = a->cur_chunk;
+    DataChunk *cur = a->chunks[cid];
     uint32_t off = atomic_fetch_add_explicit(&cur->bump, need, memory_order_relaxed);
     if (off + need > cur->cap) {
-        assert(p->n_chunks < LONG_MAX_CHUNKS);
-        uint16_t new_id = p->n_chunks++;
+        assert(a->n_chunks < LONG_MAX_CHUNKS);
+        uint16_t new_id = a->n_chunks++;
         uint32_t new_cap = cur->cap * 2;
         if (new_cap < IP_CHUNK_MIN) new_cap = IP_CHUNK_MIN;
         if (new_cap < need * 4) new_cap = need * 4;
-        p->chunks[new_id] = _long_chunk_new(new_cap);
-        p->cur_chunk = (uint8_t)new_id;
+        a->chunks[new_id] = _arena_chunk_new(new_cap);
+        a->cur_chunk = (uint8_t)new_id;
         cid = (uint8_t)new_id;
-        off = atomic_fetch_add_explicit(&p->chunks[cid]->bump, need, memory_order_relaxed);
+        off = atomic_fetch_add_explicit(&a->chunks[cid]->bump, need, memory_order_relaxed);
     }
     *cid_out = cid; *off_out = off;
 }
 
-static inline const uint8_t *_long_entry_data(const LongPool *p, const LongEntry *eh) {
-    return p->chunks[eh->chunk_id]->data + eh->u.offset;
+/* ----------------------------------------------------------------------
+ * POOL — slot-indexed headers + immutable arena
+ * ---------------------------------------------------------------------- */
+typedef enum : uint8_t { LK_FREE = 0, LK_OWNED = 1 } EntryKind;
+
+typedef struct __attribute__((aligned(4))) {
+    uint32_t hash_gen;          /* [31:8] = 24-bit hash, [7:0] = monotonic gen */
+    uint16_t len;
+    uint8_t  kind;              /* LK_FREE (0) = empty, LK_OWNED (1) = live */
+    uint8_t  chunk_id;
+    union { uint32_t offset; uintptr_t _ext; } u;
+    uint8_t  _pad[16];
+} Entry;
+
+_Static_assert(sizeof(Entry) == 32, "Entry must be 32 bytes");
+
+typedef struct {
+    Entry            *headers;  /* M entries, indexed by slot position */
+    Arena             arena;
+    uint32_t          M;
+    uint16_t          pool_id;  /* even */
+    uint64_t          seed;
+    _Atomic uint32_t  n_entries;
+    _Atomic uint32_t  n_collisions;
+    _Atomic uint32_t  seq;      /* seqlock: odd during a write, even when stable */
+    uint32_t          max_entries;
+    pthread_mutex_t   lock;
+} Pool;
+
+static inline const uint8_t *_entry_data(const Pool *p, const Entry *eh) {
+    return p->arena.chunks[eh->chunk_id]->data + eh->u.offset;
 }
 
-static inline bool _long_entry_matches(const LongPool *p, const LongEntry *eh,
-                                       const char *s, uint32_t len) {
-    const uint8_t *ed = _long_entry_data(p, eh);
+static inline bool _entry_matches(const Pool *p, const Entry *eh, const char *s, uint32_t len) {
+    const uint8_t *ed = _entry_data(p, eh);
 #ifdef __AVX2__
-    /* safe: long-pool payloads are padded to 32-byte multiples */
+    /* safe: arena payloads are padded to 32-byte multiples */
     uint32_t i = 0;
     for (; i + 32 <= len; i += 32) {
         __m256i a = _mm256_loadu_si256((const __m256i *)(ed + i));
@@ -400,46 +246,45 @@ static inline bool _long_entry_matches(const LongPool *p, const LongEntry *eh,
 }
 
 /* publish header payload (word 1 = offset) then word 0 (hash_gen|len|kind|
- * chunk_id) LAST with release. A lock-free reader acquires word 0 and thus
- * sees the offset. __atomic_* builtins are used because LongEntry is a
- * plain struct (not _Atomic-qualified); they are the standard GCC/clang
- * mechanism for atomics on non-_Atomic storage. */
-static inline void _long_store_header(LongEntry *dst, const LongEntry *src) {
+ * chunk_id) LAST with release. __atomic_* builtins are used because Entry
+ * is a plain struct; they are the standard GCC/clang atomics for
+ * non-_Atomic storage. */
+static inline void _store_header(Entry *dst, const Entry *src) {
     const uint64_t *s = (const uint64_t *)src;
     uint64_t *d = (uint64_t *)dst;
     __atomic_store_n(d + 1, s[1], __ATOMIC_RELAXED);  /* u.offset */
     __atomic_store_n(d,     s[0], __ATOMIC_RELEASE);  /* hash_gen|len|kind|chunk_id */
 }
 
-static LongPool *long_pool_create(uint16_t pool_id, uint32_t expected, uint64_t seed) {
+static Pool *pool_create(uint16_t pool_id, uint32_t expected, uint64_t seed) {
     if (expected < 64) expected = 64;
     uint32_t M = 1;
     while (M < (uint32_t)(expected * LONG_LOAD_DEN / LONG_LOAD_NUM)) M <<= 1;
 
-    LongPool *p = (LongPool *)calloc(1, sizeof(LongPool));
-    p->headers = (LongEntry *)aligned_alloc(64, M * sizeof(LongEntry));
+    Pool *p = (Pool *)calloc(1, sizeof(Pool));
+    p->headers = (Entry *)aligned_alloc(64, M * sizeof(Entry));
     assert(p->headers);
     p->M = M;
-    p->pool_id = pool_id & ~1;
+    p->pool_id = pool_id;   /* parity matters: odd=short tier, even=long tier */
     p->seed = seed;
     p->max_entries = (uint32_t)(M * LONG_LOAD_NUM / LONG_LOAD_DEN);
     pthread_mutex_init(&p->lock, NULL);
-    memset(p->headers, 0, M * sizeof(LongEntry));
+    memset(p->headers, 0, M * sizeof(Entry));
 
     uint32_t first_cap = expected * IP_AVG_STRLEN;
     if (first_cap < IP_CHUNK_MIN) first_cap = IP_CHUNK_MIN;
-    p->chunks[0] = _long_chunk_new(first_cap);
-    p->n_chunks = 1;
-    p->cur_chunk = 0;
+    p->arena.chunks[0] = _arena_chunk_new(first_cap);
+    p->arena.n_chunks = 1;
+    p->arena.cur_chunk = 0;
     return p;
 }
 
-static void long_pool_destroy(LongPool *p) {
-    for (uint16_t i = 0; i < p->n_chunks; i++) free(p->chunks[i]);
+static void pool_destroy(Pool *p) {
+    for (uint16_t i = 0; i < p->arena.n_chunks; i++) free(p->arena.chunks[i]);
     free(p->headers); free(p);
 }
 
-static SF_Handle long_intern(LongPool *p, const char *s, uint32_t len) {
+static SF_Handle pool_intern(Pool *p, const char *s, uint32_t len) {
     uint64_t h = plumshash(s, len, p->seed);
     uint32_t h32 = (uint32_t)h;
     uint32_t pos = h32 & (p->M - 1);
@@ -449,27 +294,28 @@ static SF_Handle long_intern(LongPool *p, const char *s, uint32_t len) {
     SF_Handle out = SF_NULL;
     for (uint32_t probe = 0; probe < p->M; probe++) {
         uint32_t p2 = (pos + probe) & (p->M - 1);
-        LongEntry *eh = &p->headers[p2];
+        Entry *eh = &p->headers[p2];
         uint64_t hdr = __atomic_load_n((uint64_t *)eh, __ATOMIC_RELAXED);  /* under lock */
 
         if (((uint8_t)(hdr >> 48)) == LK_FREE) {   /* empty slot */
             uint8_t cid; uint32_t off;
-            _long_chunk_alloc(p, len, &cid, &off);
-            uint8_t *dst = p->chunks[cid]->data + off;
+            _arena_alloc(&p->arena, len, &cid, &off);
+            uint8_t *dst = p->arena.chunks[cid]->data + off;
             memcpy(dst, s, len);
-            uint32_t padded = (len + 31) & ~31;
-            if (padded > len) memset(dst + len, 0, padded - len);
+            uint32_t padded = (len + 31) & ~31;   /* matches _arena_alloc's unit */
+            if (padded == 0) padded = 32;
+            if (padded > len) memset(dst + len, 0, padded - len);  /* NUL-terminate */
 
             uint8_t gen = (uint8_t)(hdr & 0xFF) + 1;   /* carry forward monotonic gen */
             if (gen == 0) gen = 1;
 
-            LongEntry ne = {0};
+            Entry ne = {0};
             ne.hash_gen = ((uint32_t)h32 << 8) | gen;
             ne.len = (uint16_t)len;
             ne.kind = LK_OWNED;
             ne.chunk_id = cid;
             ne.u.offset = off;
-            _long_store_header(eh, &ne);
+            _store_header(eh, &ne);
             atomic_fetch_add_explicit(&p->n_entries, 1, memory_order_relaxed);
             out = _encode_handle(p2, gen, p->pool_id);
             break;
@@ -479,7 +325,7 @@ static SF_Handle long_intern(LongPool *p, const char *s, uint32_t len) {
         uint32_t hg = (uint32_t)hdr;
         uint16_t elen = (uint16_t)(hdr >> 32);
         if (((hg ^ ((uint32_t)h32 << 8)) < 0x100u) && elen == len
-            && _long_entry_matches(p, eh, s, len)) {
+            && _entry_matches(p, eh, s, len)) {
             out = _encode_handle(p2, (uint8_t)hg, p->pool_id);
             break;
         }
@@ -490,13 +336,13 @@ static SF_Handle long_intern(LongPool *p, const char *s, uint32_t len) {
     return out;  /* SF_NULL if full */
 }
 
-static void long_evict(LongPool *p, SF_Handle h) {
+static void pool_evict(Pool *p, SF_Handle h) {
     if (!_handle_valid(h) || _handle_pool(h) != p->pool_id) return;
     uint32_t pos = _handle_rank(h);
     uint8_t  gen = _handle_gen(h);
     _lock(&p->lock);
     _seq_begin(&p->seq);
-    LongEntry *eh = &p->headers[pos];
+    Entry *eh = &p->headers[pos];
     uint64_t hdr = __atomic_load_n((uint64_t *)eh, __ATOMIC_ACQUIRE);
     if (((uint8_t)(hdr >> 48)) == LK_OWNED && (uint8_t)hdr == gen) {
         uint8_t ng = (uint8_t)(hdr & 0xFF) + 1; if (ng == 0) ng = 1;
@@ -509,32 +355,35 @@ static void long_evict(LongPool *p, SF_Handle h) {
     _unlock(&p->lock);
 }
 
-static uint32_t long_str(LongPool *p, SF_Handle h, char *buf, uint32_t bufcap) {
-    if (!_handle_valid(h) || _handle_pool(h) != p->pool_id) return 0;
+/* zero-copy: returns a pointer to IMMUTABLE arena bytes, valid for the
+ * pool's lifetime; sets *len_out. A stale handle returns NULL. The seqlock
+ * guarantees the {gen, len, offset} triple read here is consistent. */
+static const char *pool_str(Pool *p, SF_Handle h, uint32_t *len_out) {
+    if (!_handle_valid(h) || _handle_pool(h) != p->pool_id) return NULL;
     uint32_t pos = _handle_rank(h);
     uint8_t  gen = _handle_gen(h);
-    LongEntry *eh = &p->headers[pos];
-    uint32_t s0, s1, len;
+    Entry *eh = &p->headers[pos];
+    const char *data;
+    uint32_t s0, s1;
     do {
         do { s0 = atomic_load_explicit(&p->seq, memory_order_acquire); }
         while (s0 & 1);   /* writer in progress: retry */
         uint64_t hdr = __atomic_load_n((uint64_t *)eh, __ATOMIC_ACQUIRE);
-        if ((uint8_t)hdr != gen) return 0;   /* stale handle */
-        len = (uint16_t)(hdr >> 32);
-        if (len > bufcap) return 0;
-        memcpy(buf, _long_entry_data(p, eh), len);
+        if ((uint8_t)hdr != gen) return NULL;   /* stale handle */
+        data = (const char *)_entry_data(p, eh);  /* consistent within seqlock */
+        if (len_out) *len_out = (uint16_t)(hdr >> 32);
         s1 = atomic_load_explicit(&p->seq, memory_order_acquire);
     } while (s0 != s1);
-    return len;
+    return data;
 }
 
 /* ----------------------------------------------------------------------
- * HYBRID POOL
+ * HYBRID POOL — short tier + long tier, both arena-backed
  * ---------------------------------------------------------------------- */
 typedef struct {
-    ShortPool *short_pool;
-    LongPool  *long_pool;
-    uint16_t   base_pool_id;
+    Pool    *short_pool;   /* odd pool_id  */
+    Pool    *long_pool;    /* even pool_id */
+    uint16_t base_pool_id;
 } HybridPool;
 
 static HybridPool *hybrid_create(uint16_t base_pool_id,
@@ -544,35 +393,35 @@ static HybridPool *hybrid_create(uint16_t base_pool_id,
     HybridPool *hp = (HybridPool *)calloc(1, sizeof(HybridPool));
     assert(hp);
     hp->base_pool_id = base_pool_id;
-    hp->short_pool = short_pool_create((uint16_t)(base_pool_id * 2 + 1), expected_short, seed);
-    hp->long_pool  = long_pool_create ((uint16_t)(base_pool_id * 2),     expected_long,  seed);
+    hp->short_pool = pool_create((uint16_t)(base_pool_id * 2 + 1), expected_short, seed);
+    hp->long_pool  = pool_create((uint16_t)(base_pool_id * 2),     expected_long,  seed);
     return hp;
 }
 
 static void hybrid_destroy(HybridPool *hp) {
-    if (hp->short_pool) short_pool_destroy(hp->short_pool);
-    if (hp->long_pool)  long_pool_destroy(hp->long_pool);
+    if (hp->short_pool) pool_destroy(hp->short_pool);
+    if (hp->long_pool)  pool_destroy(hp->long_pool);
     free(hp);
 }
 
 static SF_Handle hybrid_intern(HybridPool *hp, const char *s, uint32_t len) {
     if (len <= SHORT_MAX_LEN) {
-        SF_Handle h = short_intern(hp->short_pool, s, len);
+        SF_Handle h = pool_intern(hp->short_pool, s, len);
         if (_handle_valid(h)) return h;
     }
-    return long_intern(hp->long_pool, s, len);
+    return pool_intern(hp->long_pool, s, len);
 }
 
 static void hybrid_evict(HybridPool *hp, SF_Handle h) {
     if (!_handle_valid(h)) return;
-    if (_handle_pool(h) & 1) short_evict(hp->short_pool, h);
-    else                     long_evict(hp->long_pool, h);
+    if (_handle_pool(h) & 1) pool_evict(hp->short_pool, h);
+    else                     pool_evict(hp->long_pool, h);
 }
 
-static uint32_t hybrid_str(HybridPool *hp, SF_Handle h, char *buf, uint32_t bufcap) {
-    if (!_handle_valid(h)) return 0;
-    if (_handle_pool(h) & 1) return short_str(hp->short_pool, h, buf, bufcap);
-    else                     return long_str(hp->long_pool, h, buf, bufcap);
+static const char *hybrid_str(HybridPool *hp, SF_Handle h, uint32_t *len_out) {
+    if (!_handle_valid(h)) return NULL;
+    if (_handle_pool(h) & 1) return pool_str(hp->short_pool, h, len_out);
+    else                     return pool_str(hp->long_pool, h, len_out);
 }
 
 /* ----------------------------------------------------------------------
