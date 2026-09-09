@@ -6,20 +6,18 @@
  * LIFETIME, grounded in the same machinery as achtc's memory model:
  *
  *   LIFETIME TIERS (SPUR):
- *     T0  transient — intern(s) puts a string here. It is reclaimed in bulk
- *         at the next epoch boundary. Zero-copy pointers into T0 are valid
- *         only until hybrid_epoch_end().
- *     T1  stable   — intern_stable(s) puts a string here. It survives epoch
- *         boundaries; its bytes live until the pool is destroyed.
+ *     T1  stable   — intern(s) puts a string here (the DEFAULT). Its bytes
+ *         live until the pool is destroyed.
+ *     T0  scratch  — intern_scratch(s) puts a string here. It is auto-cleared
+ *         in bulk at the next epoch boundary. Zero-copy pointers into T0 are
+ *         valid only until hybrid_epoch_end().
  *
  *   EPOCHS (e-mesh):
- *     hybrid_epoch_end() returns the T0 bump arena to its base in one bulk
- *     free (no per-entry work). The contract is that every T0 entry is
- *     evicted before the boundary; an additive-multiset fingerprint (the
- *     e-mesh `eg_w` fold: XOR of per-string hashes, self-inverse) is kept
- *     across intern(+)/evict(-) and verified to be zero at the boundary —
- *     so a live T0 entry that would be reclaimed is DETECTED, not silently
- *     dropped. T1's fingerprint is monotonic and checked on demand.
+ *     hybrid_epoch_end() invalidates every live scratch entry (gen bumped)
+ *     and returns the T0 bump arena to its base in one bulk free — no
+ *     per-entry work, no caller evict. Stale scratch handles resolve to NULL
+ *     afterward. This is the e-mesh boundary distilled: a quiescent point
+ *     where all scratch state is provably dropped.
  *
  *   SIZE TIERS (independent): strings <= SHORT_MAX_LEN go to a smaller,
  *   hotter short pool; longer strings to the long pool. Both pools carry a
@@ -198,15 +196,13 @@ _Static_assert(sizeof(Entry) == 32, "Entry must be 32 bytes");
 
 typedef struct {
     Entry            *headers;
-    Arena             t0;       /* transient — bulk-freed at epoch_end */
+    Arena             t0;       /* scratch — bulk-freed at epoch_end */
     Arena             t1;       /* stable — freed at destroy */
     uint32_t          M;
     uint16_t          pool_id;
     uint64_t          seed;
-    uint64_t          fp_seed;  /* independent fold seed */
     _Atomic uint32_t  n_entries;
     _Atomic uint32_t  n_collisions;
-    _Atomic uint64_t  t0_fp;    /* e-mesh additive fold over live T0 strings */
     _Atomic uint32_t  seq;
     uint32_t          max_entries;
     pthread_mutex_t   lock;
@@ -260,7 +256,6 @@ static Pool *pool_create(uint16_t pool_id, uint32_t expected, uint64_t seed) {
     p->M = M;
     p->pool_id = pool_id;
     p->seed = seed;
-    p->fp_seed = seed ^ 0x9E3779B97F4A7C15ULL;
     p->max_entries = (uint32_t)(M * LONG_LOAD_NUM / LONG_LOAD_DEN);
     pthread_mutex_init(&p->lock, NULL);
     memset(p->headers, 0, M * sizeof(Entry));
@@ -314,8 +309,6 @@ static SF_Handle pool_intern(Pool *p, const char *s, uint32_t len, uint8_t tier)
             ne.offset = off;
             ne.tier = tier;
             _store_header(eh, &ne);
-            if (tier == TIER_T0)
-                atomic_fetch_xor_explicit(&p->t0_fp, plumshash(s, len, p->fp_seed), memory_order_relaxed);
             atomic_fetch_add_explicit(&p->n_entries, 1, memory_order_relaxed);
             out = _encode_handle(p2, gen, p->pool_id, tier == TIER_T1 ? IR_TIER_T1 : IR_TIER_T0);
             break;
@@ -344,14 +337,9 @@ static void pool_evict(Pool *p, SF_Handle h) {
     Entry *eh = &p->headers[pos];
     uint64_t hdr = __atomic_load_n((uint64_t *)eh, __ATOMIC_ACQUIRE);
     if (((uint8_t)(hdr >> 48)) == LK_OWNED && (uint8_t)hdr == gen) {
-        if (eh->tier == TIER_T0) {
-            const char *d = (const char *)_entry_data(p, eh);
-            uint16_t l = (uint16_t)(hdr >> 32);
-            atomic_fetch_xor_explicit(&p->t0_fp, plumshash(d, l, p->fp_seed), memory_order_relaxed);
-        }
         uint8_t ng = (uint8_t)(hdr & 0xFF) + 1; if (ng == 0) ng = 1;
-        uint64_t nhdr = (hdr & ~0xFFull) | ng;
-        nhdr &= ~(0xFFull << 48);
+        uint64_t nhdr = (hdr & ~0xFFull) | ng;   /* bump gen */
+        nhdr &= ~(0xFFull << 48);                /* kind = LK_FREE */
         __atomic_store_n((uint64_t *)eh, nhdr, __ATOMIC_RELEASE);
         atomic_fetch_sub_explicit(&p->n_entries, 1, memory_order_relaxed);
     }
@@ -378,20 +366,34 @@ static const char *pool_str(Pool *p, SF_Handle h, uint32_t *len_out) {
     return data;
 }
 
-/* e-mesh epoch boundary: bulk-reclaim the T0 (transient) arena. The caller
- * must have evicted every T0 entry first; the additive fingerprint verifies
- * it — a nonzero fold means a live T0 entry would be reclaimed (a leak),
- * which is reported and leaves the epoch uncommitted. */
-static int pool_epoch_end(Pool *p) {
-    uint64_t fp = atomic_load_explicit(&p->t0_fp, memory_order_acquire);
-    if (fp != 0) return 1;   /* live T0 entries remain: leak */
+/* e-mesh epoch boundary: auto-clear the scratch (T0) tier. Every live T0
+ * entry's slot is invalidated (gen bumped) and the T0 arena is bulk-freed
+ * and reset — no per-entry work, no caller evict. Stale scratch handles
+ * resolve to NULL afterward. Returns the number of scratch entries cleared
+ * (0 means the caller had no live scratch at the boundary). */
+static uint32_t pool_epoch_end(Pool *p) {
+    uint32_t cleared = 0;
     _lock(&p->lock);
+    _seq_begin(&p->seq);
+    for (uint32_t i = 0; i < p->M; i++) {
+        Entry *eh = &p->headers[i];
+        uint64_t hdr = __atomic_load_n((uint64_t *)eh, __ATOMIC_ACQUIRE);
+        if (((uint8_t)(hdr >> 48)) == LK_OWNED && eh->tier == TIER_T0) {
+            uint8_t ng = (uint8_t)(hdr & 0xFF) + 1; if (ng == 0) ng = 1;
+            uint64_t nhdr = (hdr & ~0xFFull) | ng;
+            nhdr &= ~(0xFFull << 48);   /* kind = LK_FREE */
+            __atomic_store_n((uint64_t *)eh, nhdr, __ATOMIC_RELEASE);
+            atomic_fetch_sub_explicit(&p->n_entries, 1, memory_order_relaxed);
+            cleared++;
+        }
+    }
     _arena_free(&p->t0);
     uint32_t cap = p->max_entries * IP_AVG_STRLEN;
     if (cap < IP_CHUNK_MIN) cap = IP_CHUNK_MIN;
     _arena_init(&p->t0, cap);
+    _seq_end(&p->seq);
     _unlock(&p->lock);
-    return 0;
+    return cleared;
 }
 
 /* ----------------------------------------------------------------------
@@ -425,14 +427,14 @@ static Pool *_tier_pool(HybridPool *hp, SF_Handle h) {
     return (_handle_pool(h) & 1) ? hp->short_pool : hp->long_pool;
 }
 
-static SF_Handle hybrid_intern(HybridPool *hp, const char *s, uint32_t len) {       /* T0 */
-    Pool *p = (len <= SHORT_MAX_LEN) ? hp->short_pool : hp->long_pool;
-    return pool_intern(p, s, len, TIER_T0);
-}
-
-static SF_Handle hybrid_intern_stable(HybridPool *hp, const char *s, uint32_t len) {/* T1 */
+static SF_Handle hybrid_intern(HybridPool *hp, const char *s, uint32_t len) {       /* T1 stable (default) */
     Pool *p = (len <= SHORT_MAX_LEN) ? hp->short_pool : hp->long_pool;
     return pool_intern(p, s, len, TIER_T1);
+}
+
+static SF_Handle hybrid_intern_scratch(HybridPool *hp, const char *s, uint32_t len) {/* T0 transient */
+    Pool *p = (len <= SHORT_MAX_LEN) ? hp->short_pool : hp->long_pool;
+    return pool_intern(p, s, len, TIER_T0);
 }
 
 static void hybrid_evict(HybridPool *hp, SF_Handle h) {
@@ -445,10 +447,9 @@ static const char *hybrid_str(HybridPool *hp, SF_Handle h, uint32_t *len_out) {
     return pool_str(_tier_pool(hp, h), h, len_out);
 }
 
-/* reclaim both pools' T0 arenas; returns nonzero if any live T0 entry
- * remains (leak) */
-static int hybrid_epoch_end(HybridPool *hp) {
-    return pool_epoch_end(hp->short_pool) | pool_epoch_end(hp->long_pool);
+/* auto-clear both pools' scratch tiers; returns the total cleared */
+static uint32_t hybrid_epoch_end(HybridPool *hp) {
+    return pool_epoch_end(hp->short_pool) + pool_epoch_end(hp->long_pool);
 }
 
 /* ----------------------------------------------------------------------
@@ -457,7 +458,6 @@ static int hybrid_epoch_end(HybridPool *hp) {
 typedef struct {
     uint32_t short_entries, short_max;
     uint32_t long_entries, long_max, long_collisions;
-    uint64_t short_t0_fp, long_t0_fp;
     double   short_load, long_load;
 } HybridStats;
 
@@ -468,8 +468,6 @@ static HybridStats hybrid_stats(HybridPool *hp) {
     s.long_entries = atomic_load_explicit(&hp->long_pool->n_entries, memory_order_relaxed);
     s.long_max = hp->long_pool->M;
     s.long_collisions = atomic_load_explicit(&hp->long_pool->n_collisions, memory_order_relaxed);
-    s.short_t0_fp = atomic_load_explicit(&hp->short_pool->t0_fp, memory_order_relaxed);
-    s.long_t0_fp  = atomic_load_explicit(&hp->long_pool->t0_fp, memory_order_relaxed);
     s.short_load = (double)s.short_entries / s.short_max;
     s.long_load = (double)s.long_entries / s.long_max;
     return s;
@@ -479,11 +477,12 @@ static void hybrid_print_stats(HybridPool *hp) {
     HybridStats s = hybrid_stats(hp);
     fprintf(stderr,
         "[HybridPool id=%u]\n"
-        "  Short pool: %u / %u slots (%.1f%%), t0_fp=%016llx\n"
-        "  Long pool : %u / %u slots (%.1f%%), collisions=%u, t0_fp=%016llx\n",
+        "  Short pool: %u / %u slots (%.1f%%)\n"
+        "  Long pool : %u / %u slots (%.1f%%), collisions=%u\n",
         hp->base_pool_id,
-        s.short_entries, s.short_max, s.short_load * 100.0, (unsigned long long)s.short_t0_fp,
-        s.long_entries, s.long_max, s.long_load * 100.0, s.long_collisions, (unsigned long long)s.long_t0_fp);
+        s.short_entries, s.short_max, s.short_load * 100.0,
+        s.long_entries, s.long_max, s.long_load * 100.0,
+        s.long_collisions);
 }
 
 static inline void _hybrid_cleanup(HybridPool **hp) { if (*hp) { hybrid_destroy(*hp); *hp = NULL; } }

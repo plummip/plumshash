@@ -146,33 +146,32 @@ static int phase4(void) {
 }
 
 static int phase5(void) {
-    /* SPUR-tier + e-mesh-epoch on a FRESH pool (the main pool's T0 is
-     * populated by phases 1-4 and would read as a false leak). */
+    /* SPUR-tier + e-mesh-epoch: intern() is stable (survives epoch_end),
+     * intern_scratch() is transient (auto-cleared). */
     HybridPool *tp = hybrid_create(5, 64, 64);
-    SF_Handle sh = hybrid_intern_stable(tp, "stable-foo", 10);
-    SF_Handle th = hybrid_intern(tp, "transient-bar", 13);
+    SF_Handle sh = hybrid_intern(tp, "stable-foo", 10);
+    SF_Handle th = hybrid_intern_scratch(tp, "transient-bar", 13);
 
     uint32_t sl = 0, tl = 0;
     const char *ss = hybrid_str(tp, sh, &sl);
     const char *ts = hybrid_str(tp, th, &tl);
     if (!ss || sl != 10 || !ts || tl != 13) { fprintf(stderr, "phase5: initial resolve fail\n"); return 1; }
 
-    /* contract: evict every T0 entry before the boundary */
-    hybrid_evict(tp, th);
-    if (hybrid_epoch_end(tp) != 0) { fprintf(stderr, "phase5: epoch_end saw an unexpected leak\n"); return 1; }
+    /* epoch_end auto-clears the scratch tier (no manual evict) */
+    uint32_t cleared = hybrid_epoch_end(tp);
+    if (cleared != 1) { fprintf(stderr, "phase5: expected 1 cleared, got %u\n", cleared); return 1; }
 
-    /* T1 survives */
+    /* stable survives the boundary */
     uint32_t sl2 = 0;
     const char *ss2 = hybrid_str(tp, sh, &sl2);
     if (!ss2 || sl2 != 10 || memcmp(ss2, "stable-foo", 10)) { fprintf(stderr, "phase5: stable did not survive epoch\n"); return 1; }
-    /* T0 is gone: stale handle resolves NULL */
-    if (hybrid_str(tp, th, NULL) != NULL) { fprintf(stderr, "phase5: transient not reclaimed\n"); return 1; }
+    /* scratch is gone: stale handle resolves NULL */
+    if (hybrid_str(tp, th, NULL) != NULL) { fprintf(stderr, "phase5: scratch not cleared\n"); return 1; }
 
-    /* fingerprint: intern a T0 without evicting -> epoch_end must detect it */
-    SF_Handle lh = hybrid_intern(tp, "leak-me", 7);
-    if (hybrid_epoch_end(tp) == 0) { fprintf(stderr, "phase5: live T0 leak not detected\n"); return 1; }
-    hybrid_evict(tp, lh);
-    if (hybrid_epoch_end(tp) != 0) { fprintf(stderr, "phase5: epoch_end failed after evict\n"); return 1; }
+    /* scratch can be re-interned next epoch (gen bumped) */
+    SF_Handle th2 = hybrid_intern_scratch(tp, "transient-bar", 13);
+    if (th2.u == th.u) { fprintf(stderr, "phase5: re-intern scratch did not bump gen\n"); return 1; }
+    hybrid_epoch_end(tp);
 
     hybrid_destroy(tp);
     return 0;
