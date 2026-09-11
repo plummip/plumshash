@@ -5,7 +5,7 @@
  * sizes 4B through 4KB.  Uses clock_gettime() for nanosecond
  * wall‑clock timing.  Inline asm barriers prevent DCE.
  *
- * Compile:  gcc -O3 -Wall -Wextra -o test_speed test_speed.c
+ * Compile: clang -O3 -march=native -Wall -Wextra -o test_speed test_speed.c
  * Run:      ./test_speed
  */
 #define PLUMSHASH_IMPLEMENTATION

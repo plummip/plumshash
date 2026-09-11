@@ -11,7 +11,7 @@
  * 6. Hash flooding simulation — crafted near-collision keys
  * 7. Length extension — does h(k||m1) leak h(k||m1||m2)?
  *
- * Compile: gcc -O3 -march=armv8-a -Wall -Wextra -o security_test security_test.c -I. -lm
+ * Compile: clang -O2 -Irefs -I. -o test_security test_security.c
  */
 #define PLUMSHASH_IMPLEMENTATION
 #include "plumshash.h"

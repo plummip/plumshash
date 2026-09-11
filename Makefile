@@ -1,11 +1,16 @@
-# PlumsHash v1.0.0 — build, test, and benchmark
+# PlumsHash v1.2.0 — build, test, and benchmark
 # Test/bench sources need a C11 compiler; benches use -march=native.
 
-CC       ?= clang
+# `CC ?= clang` never fires: make predefines CC=cc, so ?= sees it as set and the
+# documented clang default is silently ignored. This idiom replaces only make's
+# built-in default — `CC=gcc make` and `make CC=gcc` both still win.
+ifeq ($(origin CC),default)
+CC       = clang
+endif
 CFLAGS   ?= -O3 -march=native -Wall -Wextra
 REF      := -Irefs -Irefs/t1ha -I.
 
-TESTS    := test_sanitize test_quality test_comb16 test_security \
+TESTS    := test_sanitize test_quality test_comb16 test_security test_headers \
             smhasher_plums test_edge test_extensive test_hybrid
 BENCHES  := bench_compete test_speed
 BINS     := $(TESTS) $(BENCHES)
@@ -26,6 +31,10 @@ test_comb16: test_comb16.c plumshash.h refs/rapidhash.h refs/xxhash.h
 
 test_security: test_security.c plumshash.h
 	$(CC) -O2 $(REF) -o $@ test_security.c
+
+# Both headers in one TU — the v1.2.0 integration path (see test_headers.c).
+test_headers: test_headers.c plumshash.h hybrid_intern.h
+	$(CC) $(CFLAGS) -pthread -o $@ test_headers.c
 
 smhasher_plums: smhasher_plums.c plumshash.h
 	$(CC) $(CFLAGS) -o $@ smhasher_plums.c -lm
@@ -48,16 +57,33 @@ test_speed: test_speed.c plumshash.h
 
 # ── gates ────────────────────────────────────────────────────────────────
 # Quality gate: ASan/UBSan edge checks + quality suite + combination
-# reproduction + security audit. Run `make test` after any change.
+# reproduction + security audit + intern-pool stress. Run after any change.
+# comb16 is checked explicitly: 3 variants x 22 sizes = 66 data rows, and each
+# must be fully distinct (maxgroup=1). The old `grep -vcE` form also counted
+# the three "-- variant --" headers, so it printed 3 on success and could not
+# fail on an empty/errored run.
 test: all
 	ASAN_OPTIONS=detect_leaks=0 ./test_sanitize | tail -1
 	./test_quality | tail -1
-	./test_comb16 | grep -vcE 'distinct, maxgroup=1' || true
+	@out=$$(./test_comb16); \
+	 rows=$$(printf '%s\n' "$$out" | grep -c 'maxgroup='); \
+	 bad=$$(printf '%s\n' "$$out" | grep 'maxgroup=' | grep -vc 'distinct, maxgroup=1' || true); \
+	 if [ "$$rows" -eq 66 ] && [ "$$bad" -eq 0 ]; then echo "  comb16: $$rows rows, 0 not fully distinct"; \
+	 else { echo "  FAIL: comb16 rows=$$rows (want 66) bad=$$bad (want 0)"; printf '%s\n' "$$out" | grep -v 'distinct, maxgroup=1'; exit 1; }; fi
 	./test_security | tail -1
+	./test_headers | tail -1
+	./test_edge | tail -1
+	./test_extensive | grep -E 'RESULTS' | tail -1
 	./test_hybrid | tail -1
 
+# Benchmarks. `bench` writes the published min-of-7 tables to bench_results.txt
+# (gitignored) and then raw bandwidth from test_speed. Override the run count
+# or pin to a core: make bench RUNS=5 PIN=0
+RUNS ?=
+PIN  ?=
 bench: bench_compete test_speed
-	./bench_compete
+	python3 bench_min7.py $(if $(RUNS),--runs $(RUNS),) $(if $(PIN),--pin $(PIN),) > bench_results.txt
+	@echo "  -> bench_results.txt (tables)"
 	./test_speed
 
 clean:

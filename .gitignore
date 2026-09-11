@@ -11,6 +11,7 @@ test_sanitize
 test_quality
 test_comb16
 test_security
+test_headers
 smhasher_plums
 test_edge
 test_extensive

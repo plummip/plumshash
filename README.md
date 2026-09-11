@@ -9,6 +9,9 @@ dependencies, MPL-2.0.
   including 0, no globals, no allocation, no platform-specific code
 - **Verified** — SMHasher full battery (all 15 groups) + standalone quality
   gates (see [Testing](#testing))
+- **Ships with** — `hybrid_intern.h`, a string-intern pool on the same hash:
+  lock-free reads, zero-copy `str()`, stable + epoch-scratch tiers
+  (see [hybrid_intern.h](#hybrid_internh--string-interning-on-plumshash))
 
 ## Quick start
 
@@ -54,7 +57,9 @@ cryptographic — do not use for passwords, signatures, or MACs.
 
 Version macros are defined in the header:
 `PLUMSHASH_VERSION_MAJOR` / `_MINOR` / `_PATCH` and `PLUMSHASH_VERSION`
-(`"1.1.0"`).
+(`"1.2.0"`). `hybrid_intern.h` carries the same macro shape
+(`HYBRID_INTERN_VERSION*`, currently `"1.0.0"` — it first shipped in
+PlumsHash v1.2.0).
 
 ## Design (5 regions)
 
@@ -99,125 +104,219 @@ Two findings drove the boundary down from 288:
    monotonic, so past 384B rot is the safe choice. 384 was the measured
    optimum: mum wins 289-384B, rot is flat and monotonic from 385B up.
 
+## hybrid_intern.h — string interning on PlumsHash
+
+The second header in the repo: an intern pool keyed by the same hash, built
+around two tiers of **storage** and two tiers of **lifetime**.
+
+| Tier | Call | Lifetime |
+|------|------|----------|
+| T1 stable (default) | `hybrid_intern(hp, s, len)` | until `hybrid_destroy` |
+| T0 scratch | `hybrid_intern_scratch(hp, s, len)` | until the next `hybrid_epoch_end(hp)` — bulk-cleared: no per-entry work, no caller evict |
+
+Strings are routed by size (`len <= SHORT_MAX_LEN`, default 48) into a short
+or a long pool; each pool carries its own T0/T1 pair and its own arena. All
+string bytes live in immutable bump arenas, so `hybrid_str()` is zero-copy —
+it returns a pointer, valid until pool destroy (T1) or the epoch boundary
+(T0). Reads are lock-free behind a per-pool seqlock, writes are serialized by
+a pthread mutex, and handles are NaN-boxed `{rank | gen | pool | tier}`
+(`SF_Handle`, `SF_NULL`). An evicted, epoch-cleared, or wrong-pool handle
+resolves to `NULL` — never to torn data.
+
+### API
+
+| Function | Notes |
+|----------|-------|
+| `HybridPool *hybrid_create(uint16_t base_pool_id, uint32_t expected_short, uint32_t expected_long)` | size hints, not limits; pool ids derive from `base_pool_id` |
+| `SF_Handle hybrid_intern(HybridPool*, const char *s, uint32_t len)` | T1 stable — dedup, lives until destroy |
+| `SF_Handle hybrid_intern_scratch(HybridPool*, const char *s, uint32_t len)` | T0 — dropped in bulk at the epoch boundary |
+| `const char *hybrid_str(HybridPool*, SF_Handle, uint32_t *len_out)` | zero-copy; `len_out` may be `NULL`; `NULL` return = stale/invalid handle |
+| `uint32_t hybrid_epoch_end(HybridPool*)` | clears both scratch tiers, returns entries cleared |
+| `void hybrid_evict(HybridPool*, SF_Handle)` | explicit single-entry drop |
+| `void hybrid_destroy(HybridPool*)` | frees both tiers and their arenas |
+| `HybridStats hybrid_stats(HybridPool*)`, `hybrid_print_stats(HybridPool*)` | entries/max/load per tier, long-pool collisions |
+| `HYBRID_SCOPED(name, id, short_n, long_n)` | block-scoped pool via the `cleanup` attribute |
+
+### Quick start
+
+```c
+#define PLUMSHASH_IMPLEMENTATION
+#include "hybrid_intern.h"
+
+HybridPool *hp = hybrid_create(1, 4096, 1024);   /* id, short/long size hints */
+SF_Handle h    = hybrid_intern(hp, "user:42", 7); /* T1 — lives until destroy */
+
+uint32_t    len;
+const char *s = hybrid_str(hp, h, &len);          /* zero-copy */
+
+SF_Handle tmp = hybrid_intern_scratch(hp, "req-17", 6);  /* T0 */
+hybrid_epoch_end(hp);                             /* bulk-clears T0 */
+assert(hybrid_str(hp, tmp, NULL) == NULL);        /* stale after the boundary */
+
+hybrid_destroy(hp);
+```
+
+Compile: `-O3 -std=c11 -march=native -pthread`. Tuning knobs are `#ifndef`-
+guarded at the top of the header: `SHORT_MAX_LEN` (48), `LONG_LOAD_NUM` /
+`LONG_LOAD_DEN` (3/4), `IP_AVG_STRLEN` (32), `IP_CHUNK_MIN` (256 KB),
+`LONG_MAX_CHUNKS` (256).
+
+Gate: `test_hybrid` — single-thread roundtrip/dedup/boundary sizes, 8 threads
+interning the same set concurrently (one handle per string, no duplicate
+intern), evict/gen invalidation, and evict-during-resolve (TOCTOU) churn
+against a small pool. See [Testing](#testing).
+
 ## Benchmarks vs the field
 
-Methodology (`bench_compete.c`): two harnesses, order-randomized, min-of-N,
-pinned core. Tables below are min-of-7-runs (each run is internally
-min-of-3).
+Methodology (`bench_compete.c`): two harnesses, order-randomized (size,
+variant) pairs, min-of-3 per cell over shuffled reps. The tables below are
+min-of-7 runs of that binary — `python3 bench_min7.py --runs 7`, wired as
+`make bench`. They are **unpinned**: pinning to one core (`make bench PIN=0`)
+measured 1.5-3x *slower* here (0B 10.2 vs 3.0ns; 16KB 798 vs 283ns), because
+the device's own background work shares that core and the scheduler can no
+longer dodge it — check that pinning helps before publishing pinned numbers.
 - **LATENCY** — serial seed dependency (hash-table lookup model), fixed buffer.
 - **THROUGHPUT** — independent seeds over a rotating 4 MB chunk pool (bulk/ILP model).
 
-Device: AArch64 Snapdragon (8-core), clang -O3 -march=native, 2026-09-09.
+Device: AArch64 Snapdragon (8-core), clang -O3 -march=native, 2026-09-11.
 
 > **Noise caveat:** this SoC's `walt` governor drifts DVFS on a 10-100 ms
-> scale, so absolute ns/op are not reproducible run-to-run (a stray boost
-> bin or drift bin lands inside single measurements — e.g. the 96B and 255B
-> latency rows below). Treat the field *ratios within a row* as the signal,
-> not the absolute values. The v1.1.0 improvement quoted in the Reading
-> section is from an in-process interleaved harness (min-of-15, variants
-> rotated per rep, core-pinned) that cancels this drift.
+> scale, so absolute ns/op are not reproducible run-to-run — a stray boost or
+> drift bin lands inside single measurements. Treat the field *ratios within a
+> row* as the signal, not the absolute values, and read only margins larger
+> than ~10% as real. Two artifacts below: the 96B and 255B latency rows, and
+> the 4KB throughput row, where xxh3 measured 114.0ns on 2026-09-09 and 92.7ns
+> on 2026-09-11 while every other cell in that row moved by less than 1%. The
+> v1.1.0 improvement quoted in the Reading section is from an in-process
+> interleaved harness (min-of-15, variants rotated per rep, core-pinned) that
+> cancels this drift.
 
 ### Latency (ns/op, lower is better)
 
 | Size | plums | rapidhash | wyhash | xxh3 | t1ha2 |
 |------|-------|-----------|--------|------|-------|
-| 0B | 4.6 | 5.1 | 7.1 | 6.2 | 3.4 |
-| 1B | 5.9 | 7.1 | 7.1 | 6.7 | 7.3 |
-| 3B | 5.9 | 7.1 | 7.1 | 6.7 | 7.3 |
-| 4B | 6.7 | 7.5 | 7.2 | 9.1 | 7.3 |
-| 8B | 6.7 | 5.4 | 7.2 | 9.1 | 5.3 |
-| 12B | 6.7 | 7.5 | 7.2 | 6.6 | 7.1 |
-| 16B | 6.7 | 7.5 | 7.2 | 6.6 | 8.8 |
-| 17B | 7.5 | 9.2 | 9.3 | 7.3 | 11.0 |
-| 24B | 7.5 | 9.5 | 9.3 | 7.4 | 11.6 |
-| 32B | 7.5 | 9.5 | 9.3 | 7.4 | 12.0 |
-| 47B | 9.0 | 11.7 | 11.8 | 8.9 | 14.1 |
-| 48B | 9.0 | 11.7 | 11.0 | 8.9 | 14.1 |
-| 64B | 9.0 | 14.1 | 11.0 | 8.9 | 12.8 |
-| 96B | 7.0 | 18.5 | 13.5 | 10.5 | 14.8 |
-| 112B | 12.0 | 21.9 | 13.4 | 12.1 | 18.8 |
-| 128B | 15.6 | 13.6 | 15.5 | 19.7 | 17.2 |
-| 160B | 15.8 | 14.0 | 15.8 | 16.5 | 19.1 |
-| 192B | 20.0 | 23.0 | 18.3 | 25.4 | 21.4 |
-| 224B | 20.6 | 27.2 | 20.8 | 20.8 | 23.7 |
-| 255B | 32.4 | 19.2 | 20.7 | 32.3 | 31.9 |
-| 256B | 20.9 | 19.2 | 20.7 | 32.1 | 25.9 |
-| 320B | 25.5 | 28.4 | 25.4 | 30.9 | 30.1 |
-| 384B | 31.0 | 25.7 | 28.1 | 31.4 | 34.5 |
-| 512B | 32.2 | 31.1 | 35.3 | 33.3 | 43.2 |
-| 768B | 38.5 | 43.3 | 48.1 | 39.9 | 60.6 |
-| 1KB | 43.1 | 44.0 | 60.2 | 46.0 | 78.2 |
-| 2KB | 64.9 | 80.4 | 112.9 | 77.1 | 147.5 |
-| 4KB | 108.2 | 128.1 | 214.8 | 141.5 | 287.2 |
-| 8KB | 195.6 | 287.3 | 423.0 | 267.0 | 478.6 |
-| 16KB | 368.6 | 565.6 | 833.8 | 522.9 | 1120.8 |
+| 0B | 3.0 | 4.7 | 7.1 | 6.2 | 5.0 |
+| 1B | 6.2 | 7.1 | 7.1 | 4.8 | 7.3 |
+| 3B | 5.9 | 7.1 | 7.1 | 6.7 | 5.2 |
+| 4B | 5.7 | 9.1 | 7.2 | 9.2 | 5.0 |
+| 8B | 6.7 | 7.5 | 7.2 | 9.7 | 5.2 |
+| 12B | 6.7 | 9.1 | 7.2 | 5.6 | 7.6 |
+| 16B | 6.7 | 7.5 | 7.2 | 6.6 | 8.9 |
+| 17B | 7.5 | 6.8 | 6.7 | 7.4 | 8.3 |
+| 24B | 6.3 | 9.5 | 9.5 | 5.3 | 11.6 |
+| 32B | 7.5 | 6.8 | 9.3 | 5.6 | 11.9 |
+| 47B | 6.7 | 8.4 | 11.8 | 8.9 | 16.1 |
+| 48B | 9.0 | 11.7 | 11.0 | 8.9 | 10.1 |
+| 64B | 6.5 | 15.3 | 10.9 | 6.9 | 12.9 |
+| 96B | 10.4 | 13.3 | 13.4 | 10.4 | 14.8 |
+| 112B | 12.0 | 21.8 | 10.1 | 12.1 | 18.8 |
+| 128B | 19.1 | 13.6 | 15.5 | 10.3 | 12.3 |
+| 160B | 18.6 | 13.2 | 11.1 | 26.8 | 19.2 |
+| 192B | 20.0 | 23.0 | 13.1 | 19.0 | 21.4 |
+| 224B | 20.6 | 27.2 | 17.6 | 20.8 | 23.6 |
+| 255B | 26.5 | 19.2 | 20.7 | 37.0 | 31.9 |
+| 256B | 15.0 | 13.6 | 27.1 | 31.9 | 30.5 |
+| 320B | 25.5 | 28.3 | 25.4 | 22.2 | 30.1 |
+| 384B | 39.2 | 18.9 | 28.1 | 31.3 | 34.5 |
+| 512B | 32.1 | 31.0 | 35.3 | 33.2 | 43.2 |
+| 768B | 38.5 | 31.0 | 48.2 | 30.4 | 75.0 |
+| 1KB | 43.1 | 31.5 | 43.2 | 69.8 | 77.9 |
+| 2KB | 64.6 | 80.4 | 113.0 | 52.6 | 185.4 |
+| 4KB | 108.0 | 206.7 | 170.8 | 144.1 | 287.1 |
+| 8KB | 195.6 | 386.7 | 422.9 | 218.6 | 565.6 |
+| 16KB | 283.4 | 566.9 | 834.6 | 523.6 | 1121.9 |
 
 ### Throughput (ns/op, lower is better)
 
 | Size | plums | rapidhash | wyhash | xxh3 | t1ha2 |
 |------|-------|-----------|--------|------|-------|
-| 0B | 1.6 | 1.9 | 2.1 | 1.8 | 2.8 |
-| 1B | 2.8 | 3.0 | 3.1 | 2.1 | 2.7 |
-| 3B | 2.0 | 3.0 | 2.2 | 3.0 | 3.8 |
-| 4B | 2.9 | 2.1 | 3.4 | 3.1 | 3.8 |
-| 8B | 2.1 | 2.9 | 3.4 | 2.2 | 2.9 |
-| 12B | 2.9 | 2.9 | 2.4 | 2.1 | 3.3 |
-| 16B | 2.9 | 2.1 | 3.4 | 3.0 | 4.6 |
-| 17B | 2.9 | 3.9 | 2.8 | 4.2 | 5.5 |
-| 24B | 4.1 | 2.8 | 2.5 | 3.0 | 5.5 |
-| 32B | 4.1 | 3.9 | 3.5 | 4.2 | 4.3 |
-| 47B | 6.5 | 4.7 | 4.2 | 4.8 | 6.1 |
-| 48B | 6.3 | 4.5 | 5.1 | 4.6 | 8.0 |
-| 64B | 6.3 | 5.2 | 3.7 | 6.4 | 8.2 |
-| 96B | 8.2 | 6.2 | 4.9 | 8.7 | 10.2 |
-| 112B | 10.3 | 7.5 | 4.9 | 10.9 | 8.7 |
-| 128B | 7.8 | 8.7 | 5.5 | 7.8 | 12.2 |
-| 160B | 8.8 | 7.2 | 6.3 | 10.4 | 10.1 |
-| 192B | 10.6 | 8.1 | 10.5 | 16.9 | 16.0 |
-| 224B | 11.7 | 13.1 | 11.5 | 16.8 | 17.8 |
-| 255B | 9.5 | 13.7 | 9.4 | 25.6 | 22.4 |
-| 256B | 9.0 | 12.9 | 12.3 | 19.2 | 19.7 |
-| 320B | 15.3 | 16.2 | 10.7 | 25.3 | 23.6 |
-| 384B | 18.4 | 17.2 | 13.0 | 19.1 | 27.3 |
-| 512B | 22.7 | 21.9 | 23.1 | 26.5 | 35.4 |
-| 768B | 21.1 | 23.0 | 25.7 | 22.5 | 52.3 |
-| 1KB | 25.4 | 27.3 | 48.1 | 39.1 | 69.7 |
-| 2KB | 40.3 | 73.3 | 100.1 | 71.6 | 139.3 |
-| 4KB | 99.9 | 142.8 | 203.7 | 114.0 | 278.1 |
-| 8KB | 134.1 | 280.3 | 414.4 | 187.8 | 400.9 |
-| 16KB | 259.1 | 557.4 | 828.4 | 522.6 | 1116.0 |
+| 0B | 1.5 | 1.8 | 1.9 | 1.7 | 2.2 |
+| 1B | 2.8 | 3.0 | 3.1 | 2.1 | 3.8 |
+| 3B | 2.0 | 3.0 | 3.1 | 3.0 | 2.7 |
+| 4B | 2.9 | 2.0 | 3.4 | 3.1 | 2.7 |
+| 8B | 2.9 | 2.9 | 3.4 | 3.1 | 3.8 |
+| 12B | 2.1 | 2.5 | 2.9 | 4.3 | 4.1 |
+| 16B | 2.2 | 2.9 | 3.4 | 3.0 | 4.6 |
+| 17B | 4.1 | 3.9 | 3.0 | 4.2 | 5.5 |
+| 24B | 3.9 | 2.6 | 3.5 | 4.2 | 3.9 |
+| 32B | 3.5 | 5.8 | 3.5 | 4.2 | 6.0 |
+| 47B | 6.5 | 3.4 | 5.1 | 6.7 | 8.5 |
+| 48B | 6.3 | 4.5 | 5.1 | 4.9 | 8.0 |
+| 64B | 6.3 | 3.7 | 5.1 | 4.6 | 8.2 |
+| 96B | 8.2 | 6.7 | 6.8 | 7.3 | 7.3 |
+| 112B | 10.3 | 8.2 | 4.9 | 10.8 | 12.2 |
+| 128B | 6.6 | 6.2 | 6.5 | 10.8 | 8.8 |
+| 160B | 6.3 | 10.1 | 8.6 | 9.9 | 14.1 |
+| 192B | 10.6 | 9.6 | 10.5 | 12.1 | 11.4 |
+| 224B | 11.7 | 13.1 | 8.2 | 13.8 | 17.8 |
+| 255B | 9.5 | 12.5 | 9.3 | 29.5 | 22.4 |
+| 256B | 12.6 | 12.9 | 12.3 | 25.8 | 14.1 |
+| 320B | 15.3 | 16.2 | 10.8 | 18.1 | 23.5 |
+| 384B | 18.4 | 17.3 | 18.1 | 20.8 | 27.3 |
+| 512B | 16.3 | 21.9 | 23.1 | 26.5 | 25.3 |
+| 768B | 21.1 | 32.0 | 36.0 | 37.8 | 37.5 |
+| 1KB | 24.7 | 25.6 | 40.6 | 39.1 | 69.5 |
+| 2KB | 56.2 | 100.8 | 100.2 | 96.3 | 139.1 |
+| 4KB | 100.1 | 142.6 | 203.2 | 92.7 | 278.3 |
+| 8KB | 134.1 | 279.7 | 410.3 | 188.6 | 560.9 |
+| 16KB | 329.9 | 556.6 | 828.2 | 521.4 | 1049.2 |
 
-Reading: PlumsHash leads (or ties) the field for latency across most of
-the range and dominates throughput at 512B+ (4KB: ~100 vs 114-278ns; 16KB:
-~259 vs 523-1116ns — 2-4.3x). The v1.0.0 → v1.1.0 change replaces the
-113-384B 7-lane/112B mum path with a 3-lane/48B one. Measured on the
-drift-free interleaved harness, that closes a 20-50% latency/throughput
-gap to wyhash in that window (20-33% faster in 160-320B; e.g. 160B
-29.5→20.3ns, 224B 39.3→26.3ns). The 255B latency row above is a
-measurement artifact, not the 3-lane regressing (255 = 5×48+15, a tail
-size the interleaved harness pins at ~28ns, on par with 256B).
+Reading: no variant wins everywhere, and the middle of the range is a scrum
+inside the drift — read margins, not ranks.
 
-Reproduce: `make bench` (runs `bench_compete` vs the field and
-`test_speed` for raw bandwidth).
+- **0-16B latency**: lowest or tied-lowest in every row (0B 3.0 vs 4.7-7.1;
+  4B 5.7 vs 5.0-9.2; 8B 6.7 vs 7.2-9.7).
+- **1-32B**: a three-way scrum — plums, xxh3 and rapidhash land within
+  ~1.5ns and the order flips between runs (1B: xxh3 4.8 vs plums 6.2 here;
+  plums 5.9 vs xxh3 6.7 on 2026-09-09).
+- **47-112B latency**: leader in every row (47B 6.7 vs 8.4-16.1; 112B 12.0),
+  the exception being wyhash's 10.1 at 112B.
+- **bulk 8KB-16KB**: ahead of every other variant on *both* harnesses by
+  1.3-3.4x (latency 16KB: 283.4 vs 523.6-1121.9ns; throughput 16KB: 329.9
+  vs 521.4-1049.2ns).
+- **2KB**: throughput leader (56.2 vs 96.3-139.1); latency second (64.6),
+  with xxh3's 52.6 and plums' 64.9 trading places between the two runs.
+
+Everything else (128-192B, 256B-1KB latency, 4KB throughput) sits inside the
+noise: cells that differ by less than ~10% in this table have flipped
+direction between runs.
+
+The v1.0.0 → v1.1.0 change replaces the 113-384B 7-lane/112B mum path with a
+3-lane/48B one. Measured on the drift-free interleaved harness, that closes a
+20-50% latency/throughput gap to wyhash in that window (20-33% faster in
+160-320B; e.g. 160B 29.5→20.3ns, 224B 39.3→26.3ns). The 255B latency row
+above is a measurement artifact, not the 3-lane regressing (255 = 5×48+15, a
+tail size the interleaved harness pins at ~28ns, on par with 256B).
+
+Reproduce: `make bench` — writes these tables (min-of-7 `bench_compete` vs
+the field, unpinned) to `bench_results.txt` and then prints raw bandwidth from
+`test_speed`. `make bench RUNS=5` shortens the sweep; `PIN=<cpu>` pins it (see
+the pinning caveat above).
 
 ## Testing
 
-`make test` builds everything and runs the quality gate:
+`make test` builds everything and runs the quality gate (8 binaries):
 
 | Gate | What it checks |
 |------|----------------|
 | `test_sanitize` (ASan/UBSan) | determinism, seed sensitivity, per-position flips, avalanche ~32/64 bits (ideal), no adjacent-length collisions |
 | `test_quality` | 21/21 SMHasher-style checks (sanity, avalanche >= 25%, chi², sparse, seed independence, appended-zeroes, permutation) |
-| `test_comb16` | SMHasher Combination 16-byte reproduction: all keys distinct at every block size 16-352B — no low-weight collapse. (This caught the old linearity bug: the rotr23 lane mixes are linear in the data and a pure-XOR compression tree collapsed 100K keys to ~4K hashes; one mum per lane fixes it.) |
+| `test_comb16` | SMHasher Combination 16-byte reproduction: all keys distinct at every block size 16-352B — no low-weight collapse. The gate asserts 66 data rows (3 variants x 22 sizes) with `maxgroup=1` on every one; a collapse fails it. (This caught the old linearity bug: the rotr23 lane mixes are linear in the data and a pure-XOR compression tree collapsed 100K keys to ~4K hashes; one mum per lane fixes it.) |
 | `test_security` | multicollision bound, seed recovery attempt, differential, whitening bypass, strict avalanche, hash-flooding, length extension |
+| `test_edge` | path-boundary keys, pattern keys, tiny/long key extremes |
+| `test_extensive` | broad sanity/chi²/avalanche matrix + throughput spot checks |
+| `test_hybrid` | `hybrid_intern.h`: roundtrip/dedup/boundaries, 8-thread concurrent intern of one set, evict/gen invalidation, evict-during-resolve (TOCTOU) |
 
-Standalone suites, also built by `make all`:
+Standalone suite, built by `make all` and run by CI:
 
 | File | What it checks |
 |------|----------------|
-| `smhasher_plums.c` | SMHasher-style suite (sanity, avalanche, differential, chi², sparse, permutation, appended-zeroes) — runs in CI |
-| `test_edge.c` | path-boundary keys, pattern keys, tiny/long key extremes |
-| `test_extensive.c` | broad sanity/chi²/avalanche matrix |
+| `smhasher_plums.c` | SMHasher-style suite (sanity, avalanche, differential, chi², sparse, permutation, appended-zeroes) — runs in `.github/workflows/smhasher.yml` |
+
+Published benchmark tables come from `make bench`
+(`bench_min7.py --runs 7` over `bench_compete`, min per cell across runs,
+unpinned). `make bench RUNS=n` shortens the sweep; `PIN=<cpu>` pins it —
+slower on this device, see the Benchmarks pinning caveat.
 
 ### SMHasher (rurban fork)
 
@@ -245,6 +344,15 @@ cmake -B build && cmake --build build -j
 ```
 
 ## Status
+
+**v1.2.0** (2026-09-11) — two headers, both MPL-2.0: `plumshash.h` (the hash)
+and `hybrid_intern.h` (v1.0.0, the intern pool).
+
+| Version | Change |
+|---------|--------|
+| v1.0.0 | one header, 5 measured paths (113-384B was 7-lane/112B) |
+| v1.1.0 | 113-384B becomes 3-lane/48B mum — 20-33% faster in that window |
+| v1.2.0 | `hybrid_intern.h`: two-tier intern pool on the same hash |
 
 Benchmarked on one SoC, one compiler, one input pattern. Verify on your
 target hardware before trusting it in production.

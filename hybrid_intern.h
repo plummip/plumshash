@@ -56,6 +56,17 @@
 #include "plumshash.h"
 
 /* ----------------------------------------------------------------------
+ * VERSION
+ * ---------------------------------------------------------------------- */
+/* hybrid_intern.h first shipped in PlumsHash v1.2.0. It carries its own
+ * version because it evolves on its own schedule — plumshash.h's
+ * PLUMSHASH_VERSION tracks the hash itself. */
+#define HYBRID_INTERN_VERSION_MAJOR 1
+#define HYBRID_INTERN_VERSION_MINOR 0
+#define HYBRID_INTERN_VERSION_PATCH 0
+#define HYBRID_INTERN_VERSION "1.0.0"
+
+/* ----------------------------------------------------------------------
  * TUNING
  * ---------------------------------------------------------------------- */
 #ifndef SHORT_MAX_LEN

@@ -1,7 +1,7 @@
 /*
  * test_quality.c — SMHasher-grade quality checks for PlumsHash v1
  * Mirrors smhasher_plums.c checks/thresholds (audit report section 1).
- * Compile: clang -O2 -o test_quality test_quality.c -lm
+ * Compile: clang -O3 -march=native -Wall -Wextra -o test_quality test_quality.c -lm
  */
 #define PLUMSHASH_IMPLEMENTATION
 #include "plumshash.h"

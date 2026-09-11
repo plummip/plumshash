@@ -63,9 +63,9 @@
 #include <stddef.h>
 
 #define PLUMSHASH_VERSION_MAJOR 1
-#define PLUMSHASH_VERSION_MINOR 1
+#define PLUMSHASH_VERSION_MINOR 2
 #define PLUMSHASH_VERSION_PATCH 0
-#define PLUMSHASH_VERSION "1.1.0"
+#define PLUMSHASH_VERSION "1.2.0"
 
 #ifdef __cplusplus
 extern "C" {
@@ -76,7 +76,13 @@ uint64_t plumshash(const void *buf, size_t len, uint64_t seed);
 #endif
 #endif /* PLUMSHASH_H */
 
-#ifdef PLUMSHASH_IMPLEMENTATION
+/* Implementation section. It sits outside the PLUMSHASH_H guard above, so it
+ * carries its own once-guard: including plumshash.h more than once in the same
+ * translation unit (e.g. `#include "plumshash.h"` followed by
+ * `#include "hybrid_intern.h"`, which includes this header) must not re-emit
+ * these definitions. Define PLUMSHASH_IMPLEMENTATION in exactly one TU. */
+#if defined(PLUMSHASH_IMPLEMENTATION) && !defined(PLUMSHASH_IMPLEMENTATION_ONCE)
+#define PLUMSHASH_IMPLEMENTATION_ONCE
 #include <string.h>
 
 #if defined(__GNUC__) || defined(__clang__)
@@ -359,4 +365,4 @@ uint64_t plumshash(const void *buf, size_t len, uint64_t seed) {
     return ph_rot_bulk(p, len, seed);
 }
 
-#endif /* PLUMSHASH_IMPLEMENTATION */
+#endif /* PLUMSHASH_IMPLEMENTATION_ONCE */
