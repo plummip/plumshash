@@ -335,12 +335,59 @@ static void bench_threads(uint32_t nthreads, uint32_t per_thread) {
     report("mt", "threads_intern", best, ops, extra);
 }
 
+/* The same set interned by every thread: the dedup path. This is where the
+ * lock-free probe matters — the string is already interned, so the lookup
+ * never needs the mutex. */
+static void bench_threads_shared(uint32_t nthreads, uint32_t per_thread) {
+    uint32_t total = per_thread;
+    char *strings = malloc((size_t)total * STR_BYTES);
+    if (!strings) return;
+
+    double best = 1e30;
+    uint64_t ops = 0;
+    for (int r = 0; r < reps; r++) {
+        fill_strings(strings, total, STR_BYTES, r);
+        HYBRID_SCOPED(hp, 33, total, total);
+        pthread_t th[64];
+        ThreadArg args[64];
+        if (nthreads > 64) nthreads = 64;
+
+        double t0 = now_sec();
+        for (uint32_t t = 0; t < nthreads; t++) {
+            args[t].hp = hp;
+            args[t].strings = strings;            /* everyone interns the SAME set */
+            args[t].width = STR_BYTES;
+            args[t].count = per_thread;
+            args[t].ops = 0;
+            pthread_create(&th[t], NULL, thread_worker, &args[t]);
+        }
+        uint64_t done = 0;
+        for (uint32_t t = 0; t < nthreads; t++) {
+            pthread_join(th[t], NULL);
+            done += args[t].ops;
+        }
+        double dt = now_sec() - t0;
+        if (dt < best) best = dt;
+        ops = done;
+    }
+    free(strings);
+
+    char extra[128];
+    snprintf(extra, sizeof extra, "threads=%u ops=%llu shared=1", nthreads,
+             (unsigned long long)ops);
+    report("mt", "threads_intern_shared", best, ops, extra);
+}
+
 static void run_multi_threaded(void) {
     printf("## multi-threaded (aggregate throughput, T callers, one pool)\n");
     bench_threads(1, 50000);
     bench_threads(2, 25000);
     bench_threads(4, 12500);
     bench_threads(8, 6250);
+    bench_threads_shared(1, 50000);
+    bench_threads_shared(2, 25000);
+    bench_threads_shared(4, 12500);
+    bench_threads_shared(8, 6250);
 }
 
 int main(int argc, char **argv) {

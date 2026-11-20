@@ -503,6 +503,27 @@ static void _pool_probe(Pool *p, uint64_t h, uint32_t len,
     *insert_slot = first_del;
 }
 
+/* Write the slot and publish the ctrl byte. The ctrl byte is published
+ * LAST, so a reader that sees OCCUPIED also sees the slot and the string
+ * bytes. */
+static SF_Handle _pool_publish(Pool *p, uint32_t slot, uint64_t h,
+                                uint32_t off, uint8_t cid, uint8_t tier) {
+    uint64_t old = __atomic_load_n(&p->slots[slot], __ATOMIC_RELAXED);
+    uint8_t gen = (uint8_t)(IP_SLOT_GEN(old) + 1);
+    if (!gen) gen = 1;
+    uint64_t sl = IP_SLOT_MAKE(off, cid, tier, IP_HASH_FP(h), gen);
+    __atomic_store_n(&p->slots[slot], sl, __ATOMIC_RELAXED);
+
+    uint8_t tag = IP_HASH_TAG(h);
+    if (!tag) tag = 1;
+    uint8_t old_ctrl = __atomic_load_n(&p->ctrl[slot], __ATOMIC_RELAXED);
+    __atomic_store_n(&p->ctrl[slot], tag, __ATOMIC_RELEASE);
+    atomic_fetch_add_explicit(&p->n_entries, 1, memory_order_relaxed);
+    if (old_ctrl == IP_CTRL_DELETED)
+        atomic_fetch_sub_explicit(&p->n_tombs, 1, memory_order_relaxed);
+    return _encode_handle(slot, gen, p->pool_id, _tier_bits(tier));
+}
+
 static SF_Handle pool_intern(Pool *p, const char *s, uint32_t len, uint8_t tier) {
     /* The arena prefix (8 bytes) rides along with every string, so the
      * usable length is 8 less than the arena limit. */
@@ -510,13 +531,67 @@ static SF_Handle pool_intern(Pool *p, const char *s, uint32_t len, uint8_t tier)
     uint64_t h = plumshash(s, len, p->seed);
     Arena *a = tier == TIER_T1 ? &p->t1 : &p->t0;
 
+    uint32_t match_slot = UINT32_MAX, insert_slot = UINT32_MAX;
+    uint8_t  match_gen = 0;
+
+    if (tier == TIER_T1) {
+        /* The stable tier is never freed until the pool is destroyed, so
+         * the probe can run WITHOUT the mutex: a string that is already
+         * interned never touches the lock at all. That is the common case
+         * in real use (dedup), and it is where the shared-pool contention
+         * used to hurt. */
+        _pool_probe(p, h, len, s, tier, &match_slot, &match_gen, &insert_slot);
+        if (match_slot != UINT32_MAX)
+            return _encode_handle(match_slot, match_gen, p->pool_id, _tier_bits(tier));
+
+        /* Copy the bytes into the arena outside the lock: the arena bump
+         * allocator is atomic, and the copy is the expensive part of an
+         * insert. Only the slot claim stays under the lock. */
+        uint8_t cid; uint32_t off;
+        if (!_arena_alloc(a, len + 8u, &cid, &off)) return SF_NULL;
+        uint8_t *base = a->chunks[cid]->data + off;
+        IpPrefix *pfx = (IpPrefix *)base;
+        uint8_t *dst = base + sizeof(IpPrefix);
+        uint32_t padded = ((len + 8u + (IP_ARENA_ALIGN - 1u)) & ~(uint32_t)(IP_ARENA_ALIGN - 1u))
+                        - (uint32_t)sizeof(IpPrefix);
+        pfx->len = len;
+        pfx->reserved = 0;
+        if (len) memcpy(dst, s, len);
+        if (padded > len) memset(dst + len, 0, padded - len);
+
+        /* Claim a slot under the lock. The critical section is now short:
+         * a re-probe (to catch a concurrent insert of the same string) plus
+         * the slot write. */
+        _lock(&p->lock);
+        _seq_begin(&p->seq);
+        _pool_probe(p, h, len, s, tier, &match_slot, &match_gen, &insert_slot);
+        if (match_slot != UINT32_MAX) {
+            /* Another thread interned the same string first: its entry
+             * wins, ours is wasted arena space. */
+            SF_Handle dup = _encode_handle(match_slot, match_gen, p->pool_id,
+                                            _tier_bits(tier));
+            _seq_end(&p->seq);
+            _unlock(&p->lock);
+            return dup;
+        }
+        if (insert_slot == UINT32_MAX) {
+            _seq_end(&p->seq);
+            _unlock(&p->lock);
+            return SF_NULL;
+        }
+        SF_Handle out = _pool_publish(p, insert_slot, h, off, cid, tier);
+        _seq_end(&p->seq);
+        _unlock(&p->lock);
+        return out;
+    }
+
+    /* Scratch (T0) tier: the epoch boundary bulk-frees this arena, so
+     * everything stays under the lock — a copy outside it could write into
+     * an arena that the epoch just released. */
     _lock(&p->lock);
     _seq_begin(&p->seq);
     SF_Handle out = SF_NULL;
-    uint32_t match_slot, insert_slot;
-    uint8_t  match_gen;
     _pool_probe(p, h, len, s, tier, &match_slot, &match_gen, &insert_slot);
-
     if (match_slot != UINT32_MAX) {
         out = _encode_handle(match_slot, match_gen, p->pool_id, _tier_bits(tier));
     } else if (insert_slot != UINT32_MAX) {
@@ -531,23 +606,7 @@ static SF_Handle pool_intern(Pool *p, const char *s, uint32_t len, uint8_t tier)
             pfx->reserved = 0;
             if (len) memcpy(dst, s, len);
             if (padded > len) memset(dst + len, 0, padded - len);
-
-            uint64_t old = __atomic_load_n(&p->slots[insert_slot], __ATOMIC_RELAXED);
-            uint8_t gen = (uint8_t)(IP_SLOT_GEN(old) + 1);
-            if (!gen) gen = 1;
-            uint64_t sl = IP_SLOT_MAKE(off, cid, tier, IP_HASH_FP(h), gen);
-            __atomic_store_n(&p->slots[insert_slot], sl, __ATOMIC_RELAXED);
-
-            uint8_t tag = IP_HASH_TAG(h);
-            if (!tag) tag = 1;
-            uint8_t old_ctrl = __atomic_load_n(&p->ctrl[insert_slot], __ATOMIC_RELAXED);
-            /* Publish the ctrl byte LAST: a reader that sees OCCUPIED also
-             * sees the slot and the string bytes. */
-            __atomic_store_n(&p->ctrl[insert_slot], tag, __ATOMIC_RELEASE);
-            atomic_fetch_add_explicit(&p->n_entries, 1, memory_order_relaxed);
-            if (old_ctrl == IP_CTRL_DELETED)
-                atomic_fetch_sub_explicit(&p->n_tombs, 1, memory_order_relaxed);
-            out = _encode_handle(insert_slot, gen, p->pool_id, _tier_bits(tier));
+            out = _pool_publish(p, insert_slot, h, off, cid, tier);
         }
     }
     _seq_end(&p->seq);

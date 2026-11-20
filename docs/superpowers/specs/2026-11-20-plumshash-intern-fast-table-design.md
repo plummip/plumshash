@@ -312,42 +312,45 @@ without touching stable ones.
   oversize path.
 - `HYBRID_INTERN_MAX_POOL_ID` stays 4095 (13 bits ✓).
 
-### 4.5 Phase 4 — insert path
+### 4.5 Phase 4 — insert path  *(landed in a safe form; the CAS variant stays open)*
 
-The mutex is the throughput ceiling: every intern takes the pool lock.
+The mutex is the throughput ceiling: every intern used to take the pool lock
+for the whole probe, the arena allocation and the string copy.
 
-Target: lock-free insert.
+**Landed (phase 4a):** for the **stable tier** (T1) the probe now runs
+*without* the mutex and the string copy happens *outside* it — the arena bump
+allocator is atomic, and the copy is the expensive part of an insert. Only the
+slot claim stays under the lock, and the claim re-probes so that a string
+inserted concurrently by another thread still resolves to ONE entry (the
+loser's arena copy is wasted space, not a duplicate).
 
-1. Probe the ctrl array (lock-free reads).
-2. On a tag match, compare the slot's length and `memcmp` the data → hit →
-   return the existing handle.
-3. On no match, allocate arena space with the existing atomic bump allocator,
-   copy the bytes, publish the prefix.
-4. Claim a slot with a CAS on the ctrl byte (`EMPTY`/`DELETED` → `RESERVED` →
-   `OCCUPIED`); the tag is written with the tag bits and the state with the
-   high bit.
-5. If another thread claimed the same slot first, re-check for the duplicate
-   and return the winner's handle. The loser's arena copy is wasted space
-   (acceptable; a free-list can reclaim it later).
+The **scratch tier** (T0) keeps everything under the lock: the epoch boundary
+bulk-frees that arena, so a copy outside the lock could write into an arena
+that the epoch just released.
 
-Correctness under concurrent insert of the *same* string is the delicate part:
-the CAS on the ctrl byte plus the post-CAS duplicate check must guarantee that
-exactly one entry exists per string. This is the phase's main risk and gets its
-own stress test (N threads × the same M strings, assert one entry each).
+Measured (AArch64 phone, warm CPU, best of 3, one shared pool):
 
-**The single-threaded and the concurrent insert paths stay separate.** A pool
-is created in one mode or the other, so a pool used by one thread never pays
-for the CAS machinery (the compare-and-swap, the reservation state, the
-duplicate re-check), and a shared pool never pays for a mutex it does not
-need. The mode is a creation-time flag, not a runtime switch, so the cost is
-decided once, at `hybrid_create()` time:
+| case | before | after | |
+|---|---|---|---|
+| shared set, 2 threads | 7.24 M ops/s | 11.17 M ops/s | +54% |
+| shared set, 4 threads | 4.58 M ops/s | 14.79 M ops/s | **+223%** |
+| shared set, 8 threads | 6.66 M ops/s | 18.26 M ops/s | **+174%** |
+| unique sets, 4 threads | 2.41 M ops/s | 3.10 M ops/s | +28% |
 
-```c
-HybridPool *hp = hybrid_create(1, 4096, 1024);            /* single-threaded */
-HybridPool *hp = hybrid_create_concurrent(1, 4096, 1024); /* shared pool    */
-```
+(The shared-set rows are the dedup path: every thread interns the same
+strings, so the lock-free probe is what the measurement isolates. The
+single-threaded shared case is *slower* than before — with a cold cache the
+ctrl line, the slot line and the arena line are three misses where the old
+fat header was two. That is the price of the split table, and phase 3 is
+what removes it: a handle that carries the arena location never touches the
+table at all.)
 
-The benchmark measures them in separate sections (§4.2) for the same reason.
+**Still open (phase 4b):** a full CAS insert, where no thread ever takes the
+mutex. It needs a RESERVED ctrl state plus a probe that waits for a slot
+another thread is publishing — otherwise two threads interning the same
+string concurrently can both miss each other and create a duplicate. The
+landing above keeps the dedup guarantee by construction (the claim is under
+the lock) and buys most of the win.
 
 ---
 
