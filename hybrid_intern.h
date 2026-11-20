@@ -588,10 +588,9 @@ static void _pool_probe(Pool *p, uint64_t h, uint32_t len,
  *
  * The old arrays are retired rather than freed: a lock-free probe may still
  * be reading them. They are released when the pool is destroyed. */
-static bool _pool_grow(Pool *p) {
+static bool _pool_rebuild(Pool *p, uint32_t M2) {
     if (p->n_retired >= (uint32_t)(sizeof p->retired_ctrl / sizeof p->retired_ctrl[0]))
         return false;
-    uint32_t M2 = p->M * 2;
     if (M2 > (1u << 24)) return false;
 
     size_t ctrl_bytes = ((size_t)M2 + 63u) & ~(size_t)63u;
@@ -639,6 +638,8 @@ static bool _pool_grow(Pool *p) {
     atomic_store_explicit(&p->table_ver,
                         atomic_load_explicit(&p->table_ver, memory_order_relaxed) + 1u,
                         memory_order_release);
+    /* the rebuilt table holds only live entries: no tombstones */
+    atomic_store_explicit(&p->n_tombs, 0, memory_order_relaxed);
 
     /* retire the old arrays (a lock-free probe may still be reading them) */
     p->retired_ctrl[p->n_retired] = old_ctrl;
@@ -647,12 +648,31 @@ static bool _pool_grow(Pool *p) {
     return true;
 }
 
-/* Grow when the table gets too full. Called under the lock. */
-static void _pool_maybe_grow(Pool *p) {
-    uint32_t used = atomic_load_explicit(&p->n_entries, memory_order_relaxed) +
-                    atomic_load_explicit(&p->n_tombs, memory_order_relaxed);
-    if (used + (p->M / 4) < p->M) return;      /* below 75% — no need */
-    _pool_grow(p);
+/* Keep the table healthy. Called under the lock.
+ *
+ * - Too full -> grow: double the table.
+ * - Tombstone-heavy -> compact: rebuild at the SAME size with only the live
+ *   entries, which purges the tombstones and shortens the chains again.
+ *   This is what a backward-shift ("foster") deletion would achieve, but
+ *   without shifting entries around: a handle names an arena LOCATION, so
+ *   re-placing an entry invalidates nothing. The probe keeps its group
+ *   layout, which is why the shift-back method itself does not fit here.
+ *
+ * Both are one pass over the table plus one hash per live entry, so both
+ * are amortised O(1) per insert. */
+static void _pool_maybe_resize(Pool *p) {
+    uint32_t entries = atomic_load_explicit(&p->n_entries, memory_order_relaxed);
+    uint32_t tombs = atomic_load_explicit(&p->n_tombs, memory_order_relaxed);
+    if (entries + (p->M / 4) >= p->M) {
+        /* 75% of the LIVE entries -> grow. Tombstones do not count: a
+         * deleted slot is a reusable slot, not a full one. */
+        if (_pool_rebuild(p, p->M * 2)) return;
+    }
+    if (tombs > p->M / 4 && tombs > entries) {
+        /* a quarter of the table is tombstones and they outnumber the live
+         * entries -> compact at the same size */
+        _pool_rebuild(p, p->M);
+    }
 }
 
 /* Write the slot and publish the ctrl byte. The ctrl byte is published
@@ -752,7 +772,7 @@ static SF_Handle pool_intern(Pool *p, const char *s, uint32_t len, uint8_t tier)
             return SF_NULL;
         }
         SF_Handle out = _pool_publish(p, insert_slot, h, off, cid, tier);
-        _pool_maybe_grow(p);
+        _pool_maybe_resize(p);
         _seq_end(&p->seq);
         _unlock(&p->lock);
         return out;
@@ -784,7 +804,7 @@ static SF_Handle pool_intern(Pool *p, const char *s, uint32_t len, uint8_t tier)
             if (len) memcpy(dst, s, len);
             if (padded > len) memset(dst + len, 0, padded - len);
             out = _pool_publish(p, insert_slot, h, off, cid, tier);
-            _pool_maybe_grow(p);
+            _pool_maybe_resize(p);
         }
     }
     _seq_end(&p->seq);

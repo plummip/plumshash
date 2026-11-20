@@ -262,6 +262,49 @@ static void test_table_grows(void) {
     CHECK("grow_evict_spares_neighbours", hybrid_str(hp, h[9], NULL) != NULL);
 }
 
+/* Tombstones are reused by later inserts, but a churn-heavy pool can end up
+ * with a quarter of its table deleted. The compaction rebuilds the table at
+ * the same size with only the live entries — what a backward-shift
+ * ("foster") deletion achieves, without shifting entries around: a handle
+ * names an arena location, so re-placing an entry invalidates nothing. */
+static void test_compaction_purges_tombstones(void) {
+    enum { N = 100 };
+    static char buf[N][24];
+    static SF_Handle h[N];
+
+    HYBRID_SCOPED(hp, 17, 64, 64);          /* M starts at 128 slots */
+
+    for (int i = 0; i < N; i++) {
+        snprintf(buf[i], sizeof buf[i], "compact-%d", i);
+        h[i] = hybrid_intern(hp, buf[i], (uint32_t)strlen(buf[i]));
+    }
+    /* the table may have grown while filling; the compaction must not
+     * change its size */
+    uint32_t m0 = hp->short_pool->M;
+    /* delete most of them: the tombstones now outnumber the live entries */
+    for (int i = 0; i < N - 5; i++) hybrid_evict(hp, h[i]);
+    HybridStats st1 = hybrid_stats(hp);
+    CHECK("compaction_tombstones_present", st1.short_tombs > hp->short_pool->M / 4);
+
+    /* one more insert triggers the compaction */
+    SF_Handle extra = hybrid_intern(hp, "compact-trigger", 14);
+    CHECK("compaction_trigger_interned", extra.u != 0);
+
+    HybridStats st2 = hybrid_stats(hp);
+    CHECK("compaction_purged_tombstones", st2.short_tombs < st1.short_tombs);
+    CHECK("compaction_kept_size", hp->short_pool->M == m0);
+
+    /* the survivors still resolve, the evicted ones still do not */
+    int ok = 1;
+    for (int i = N - 5; i < N; i++) {
+        uint32_t len = 0;
+        const char *s = hybrid_str(hp, h[i], &len);
+        if (!s || len != strlen(buf[i]) || memcmp(s, buf[i], len) != 0) { ok = 0; break; }
+    }
+    CHECK("compaction_survivors_resolve", ok);
+    CHECK("compaction_evicted_still_null", hybrid_str(hp, h[0], NULL) == NULL);
+}
+
 int main(void) {
     printf("Hybrid intern lifecycle regressions\n");
     test_evict_intern_churn();
@@ -270,6 +313,7 @@ int main(void) {
     test_stale_handles_null();
     test_tombstone_reuse();
     test_table_grows();
+    test_compaction_purges_tombstones();
 
     printf("Results: %d passed, %d failed\n", passed, failed);
     return failed ? 1 : 0;
