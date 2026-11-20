@@ -58,7 +58,7 @@ cryptographic — do not use for passwords, signatures, or MACs.
 Version macros are defined in the header:
 `PLUMSHASH_VERSION_MAJOR` / `_MINOR` / `_PATCH` and `PLUMSHASH_VERSION`
 (`"1.2.0"`). `hybrid_intern.h` carries the same macro shape
-(`HYBRID_INTERN_VERSION*`, currently `"1.0.0"` — it first shipped in
+(`HYBRID_INTERN_VERSION*`, currently `"2.0.0"` — it first shipped in
 PlumsHash v1.2.0).
 
 ## Design (5 regions)
@@ -118,10 +118,13 @@ Strings are routed by size (`len <= SHORT_MAX_LEN`, default 48) into a short
 or a long pool; each pool carries its own T0/T1 pair and its own arena. All
 string bytes live in immutable bump arenas, so `hybrid_str()` is zero-copy —
 it returns a pointer, valid until pool destroy (T1) or the epoch boundary
-(T0). Reads are lock-free behind a per-pool seqlock, writes are serialized by
-a pthread mutex, and handles are NaN-boxed `{rank | gen | pool | tier}`
-(`SF_Handle`, `SF_NULL`). An evicted, epoch-cleared, or wrong-pool handle
-resolves to `NULL` — never to torn data.
+(T0). Reads are lock-free, writes are serialized by a pthread mutex, and a
+handle is an opaque 64-bit **location** — `{magic | pool | epoch | gen |
+chunk | offset}` (`SF_Handle`, `SF_NULL`) — that names a spot in the arena, not
+a slot in the table. A lookup therefore touches the arena only: the table is
+never read, and a lookup is one memory access. An evicted, epoch-cleared, or
+wrong-pool handle resolves to `NULL` — never to torn data. A handle is
+opaque: do not read it as a float (it is not NaN-boxed any more).
 
 ### API
 
@@ -139,12 +142,15 @@ resolves to `NULL` — never to torn data.
 
 ### Safety and lifetime limits
 
-- Handles are validated before table access. Out-of-range ranks, wrong-pool or
-  wrong-tier handles, and handles for free slots resolve to `NULL`; eviction
-  treats them as no-ops.
-- Intern lengths are 32-bit. Lengths above `HYBRID_INTERN_MAX_LEN` and null
-  pointers with a non-zero length are rejected with `SF_NULL`. The maximum is
-  `UINT32_MAX - 31`, leaving room for checked 32-byte arena rounding.
+- Handles are validated before any access. A handle whose pool, epoch, tier or
+  generation does not match resolves to `NULL`; eviction treats a stale handle
+  as a no-op. The generation belongs to the *location* (an eviction bumps it),
+  the epoch to the *tier* (an epoch boundary bumps it).
+- Intern lengths are 32-bit, and a string must fit inside one arena chunk.
+  Chunks are capped at 1 MB (`IP_CHUNK_MAX`) because the handle's offset is
+  20 bits and is relative to the chunk, so the usable maximum is
+  **1 MB - 8** (the 8-byte arena prefix). Longer strings, and null pointers
+  with a non-zero length, are rejected with `SF_NULL`.
 - The size hints passed to `hybrid_create()` are bounded by
   `HYBRID_INTERN_MAX_ENTRIES` (1M entries per pool). A larger hint returns
   `NULL` instead of sizing a table from an overflowed product.
@@ -164,11 +170,13 @@ resolves to `NULL` — never to torn data.
   asked to hold more live entries than its hint sized it for returns `SF_NULL`
   from `hybrid_intern()` — size the hint for the peak live set, and expect
   evicted slots to be reused rather than reclaimed in place.
-- Every interned string carries an 8-byte arena prefix (its length) in front
-  of its bytes, so the arena costs ~8–24 B more per string depending on the
-  length; `IP_ARENA_ALIGN` (16) sets the granularity. The prefix shares a
-  cache line with the start of the string, so a lookup still reads the length
-  and the data from one line.
+- Every interned string carries an 8-byte arena prefix in front of its bytes:
+  the length, the generation, and the table slot that holds it (the handle
+  names the location, so the table needs the back-pointer for eviction).
+  The arena therefore costs ~8–24 B more per string depending on the length;
+  `IP_ARENA_ALIGN` (16) sets the granularity. The prefix shares a cache line
+  with the start of the string, so a lookup reads the length and the data
+  from one line.
 
 ### Quick start
 

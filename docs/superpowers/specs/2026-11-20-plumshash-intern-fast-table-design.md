@@ -261,56 +261,61 @@ pass was noisy enough to invent a 30% regression in either direction. The
 bench now warms the CPU for 2 s and reports the best of `REPS` repetitions
 (default 5).
 
-### 4.4 Phase 3 — location-carrying handle
+### 4.4 Phase 3 — location-carrying handle  *(landed: measured results below)*
 
 `SF_Handle` stops naming a table slot and names a **location in the arena**:
 
 ```
 bit 63      magic (1)         1 for a valid handle; SF_NULL == 0
 bits 62..50 pool id (13)
-bits 49..38 epoch (12)        per tier; bumped by epoch_end (T0 only)
-bits 37..30 gen (8)           per-location generation
-bits 29..20 chunk id (10)     chunk ids 0..511 = T0, 512..1023 = T1
-bits 19..0  byte offset (20)  within the chunk
+bits 49..38 epoch (12)        per tier; bumped by epoch_end
+bits 37..30 gen (10)          per-location generation
+bits 29..20 chunk id (10)     bit 8 = the tier, bits 7..0 = the chunk
+bits 19..0  byte offset (20)  within the chunk (a chunk is <= 1 MB)
 ```
 
-The tier is **not** a separate field — it is derived from the chunk id
-(chunks 0–511 belong to the scratch arena, 512–1023 to the stable arena), and
-the epoch is per tier so that `epoch_end` can invalidate scratch handles
-without touching stable ones.
+- The **length, generation and owning slot** live in an 8-byte arena prefix
+  in front of the bytes: `[len:20][gen:8][slot:32]`. The prefix shares a
+  cache line with the start of the string, so a lookup reads the length and
+  the data from one line. The slot index lives there because the handle no
+  longer names a slot — without it an eviction could not remove the entry
+  from the table.
+- `hybrid_str(handle)`: validate the pool and the tier's epoch, then read the
+  prefix and the bytes at `chunk.base + offset`. **One memory access, and the
+  table is never touched on the read path.**
+- Staleness is caught by two independent fields: the **epoch** (per tier, so
+  a scratch handle dies at the epoch boundary) and the **gen** (per location,
+  so an eviction kills every handle pointing at it).
+- The NaN box is dropped: a 64-bit location handle needs every bit, and the
+  tier now comes from the chunk id. A handle is opaque and must not be read
+  as a float.
 
-- The **length and generation live in the arena**, in an 8-byte prefix stored
-  immediately before the string bytes:
-  `[gen(8) | len(32)]` then the bytes. The prefix shares a cache line with the
-  start of the string, so `hybrid_str()` reads length and data from one miss.
-- `hybrid_str(handle)`:
-  1. validate magic / pool, derive the tier from the chunk id, and compare the
-     tier's epoch → `NULL` if stale;
-  2. `chunk.base + offset` → read the prefix → compare `gen` → `NULL` if the
-     location was evicted or reused;
-  3. return the pointer.
+**Measured** (AArch64 phone, warm CPU, best of 5):
 
-  **One DRAM round trip, and the table is never touched on the read path.**
-- Staleness is detected by two independent fields: `epoch` (pool-wide, catches
-  scratch entries invalidated by `epoch_end`) and `gen` (per-location, catches
-  eviction and slot reuse).
-- The NaN box is dropped: the magic bit plus the tier field are enough to
-  discriminate a valid handle from `SF_NULL`.
+| case | before (phase 2) | after (phase 3) | |
+|---|---|---|---|
+| lookup, 100k | 5.0 ns | 3.1 ns | **-38%** |
+| lookup, 1M | 11.4 ns | 7.6 ns | **-33%** |
+| intern miss, 100k | 72.5 ns | 65.9 ns | -9% |
+| intern hit, 100k | 26.5 ns | 28.7 ns | +8% |
 
-**Costs and consequences of this choice**
+The lookup win is the point: the read path went from two memory accesses
+(the slot, then the arena) to one (the arena). The intern hit costs a little
+more because the prefix carries three fields instead of one.
 
-- The arena grows by 8 bytes per string, plus the rounding delta: the
-  allocation unit becomes `round_up(8 + len, 32)` instead of `round_up(len, 32)`
-  — an average overhead of ~25 B/string, ~78 % on top of `IP_AVG_STRLEN = 32`.
-  *Mitigation under consideration:* drop the alignment granularity from 32 to
-  16 bytes (the stored side no longer needs 32-byte slack now that the AVX2
-  tail uses `memcmp`), which cuts the overhead to ~12 B/string.
-- Chunk size is capped at 1 MB (20-bit offset). Chunk ids 0–511 serve the
-  scratch arena and 512–1023 the stable one — 512 MB per tier, 1 GB per pool.
-- **A string longer than 1 MB can no longer be interned.** Today the cap is
-  `UINT32_MAX - 31`. Open decision (§7.1): accept the 1 MB cap, or add an
-  oversize path.
-- `HYBRID_INTERN_MAX_POOL_ID` stays 4095 (13 bits ✓).
+**Costs, as predicted in §7.1**
+
+- A string must fit inside one chunk, and a chunk is capped at 1 MB
+  (`IP_CHUNK_MAX`) because the offset is 20 bits and chunk-relative: **the
+  usable maximum length is 1 MB - 8** (the 8-byte prefix). Longer strings are
+  rejected with `SF_NULL`. This is the one API-visible restriction.
+- The prefix grew to 8 bytes and carries the slot back-pointer.
+
+**What this unblocks for a compiler:** a rank-based handle pins its slot
+forever, so the table could never be rebuilt or grown — the pool's table size
+was fixed at `hybrid_create()`. A location handle has no such constraint:
+the table is now free to be rehashed or resized at any time, because no
+handle points into it.
 
 ### 4.5 Phase 4 — insert path  *(landed in a safe form; the CAS variant stays open)*
 

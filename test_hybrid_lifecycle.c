@@ -48,6 +48,21 @@ static int failed = 0;
 # define HYBRID_INTERN_HAS_TOMBSTONES 0
 #endif
 
+/* The table slot that holds a string. The handle names the LOCATION, not
+ * the slot, so the slot index comes from the arena prefix. */
+static uint32_t slot_of(HybridPool *hp, SF_Handle h) {
+    Pool *p = (_handle_pool(h) == hp->short_pool->pool_id) ? hp->short_pool
+                                                            : hp->long_pool;
+    uint16_t chunk = _handle_chunk(h);
+    uint8_t tier = (chunk & IR_CHUNK_TIER) ? TIER_T1 : TIER_T0;
+    uint8_t index = (uint8_t)(chunk & IR_CHUNK_INDEX);
+    const Arena *a = tier == TIER_T1 ? &p->t1 : &p->t0;
+    if (index >= a->n_chunks) return UINT32_MAX;
+    const IpPrefix *pfx = (const IpPrefix *)(a->chunks[index]->data +
+                                             _handle_offset(h));
+    return IP_PREFIX_SLOT(pfx);
+}
+
 /* Home slot of a string in the short pool — the index derivation is
  * hash & (M - 1), so the seed decides which chain a string lands on. */
 static uint32_t home_of(HybridPool *hp, const char *s, uint32_t len) {
@@ -109,7 +124,7 @@ static void test_dedup_survives_eviction(void) {
     SF_Handle ha = hybrid_intern(hp, a, alen);
     SF_Handle hb = hybrid_intern(hp, partner, plen);
     CHECK("dedup_both_interned", ha.u != 0 && hb.u != 0);
-    CHECK("dedup_chain_shared", _handle_rank(ha) != _handle_rank(hb));
+    CHECK("dedup_chain_shared", slot_of(hp, ha) != slot_of(hp, hb));
 
     /* delete the head of the chain; the second string must still resolve */
     hybrid_evict(hp, ha);
@@ -172,7 +187,7 @@ static void test_tombstone_reuse(void) {
     CHECK("tombstone_reuse_partner_interned", hb.u != 0);
 
     SF_Handle ha = hybrid_intern(hp, a, alen);
-    uint32_t slot = _handle_rank(ha);
+    uint32_t slot = slot_of(hp, ha);
     hybrid_evict(hp, ha);                          /* delete the chain head */
 
     HybridStats st1 = hybrid_stats(hp);
@@ -195,7 +210,7 @@ static void test_tombstone_reuse(void) {
     }
     SF_Handle hn = hybrid_intern(hp, probe, probe_len);
     CHECK("tombstone_reuse_interned", hn.u != 0);
-    CHECK("tombstone_reuse_same_slot", _handle_rank(hn) == slot);
+    CHECK("tombstone_reuse_same_slot", slot_of(hp, hn) == slot);
     HybridStats st2 = hybrid_stats(hp);
 #if HYBRID_INTERN_HAS_TOMBSTONES
     CHECK("tombstone_reuse_count_dropped", st2.short_tombs < st1.short_tombs);

@@ -68,9 +68,12 @@ static void test_forged_rank(void) {
     if (pid == 0) {
         HybridPool *hp = hybrid_create(2, 64, 64);
         Pool *p = hp->short_pool;
-        SF_Handle forged = _encode_handle(p->M + 1, 0, p->pool_id, IR_TIER_T1);
+        /* A location handle whose chunk index is outside the arena. */
+        SF_Handle forged = _encode_handle(p->pool_id, p->epoch[1], 1,
+                                          (uint16_t)(IR_CHUNK_TIER | 0x3FFu),
+                                          0);
         if (hybrid_str(hp, forged, NULL) != NULL) _exit(2);
-        hybrid_evict(hp, forged); /* must not index outside the table */
+        hybrid_evict(hp, forged); /* must not index outside the arena */
         _exit(0);
     }
 
@@ -87,8 +90,12 @@ static void test_forged_rank(void) {
 static void test_tier_mismatch(void) {
     HybridPool *hp = hybrid_create(3, 64, 64);
     SF_Handle stable = hybrid_intern(hp, "stable-tier", 11);
-    SF_Handle forged = _encode_handle(_handle_rank(stable), _handle_gen(stable),
-                                      _handle_pool(stable), IR_TIER_T0);
+    /* Flip the tier bit of the chunk id: the handle then names a location
+     * in the other tier's arena. */
+    uint16_t chunk = (uint16_t)(_handle_chunk(stable) ^ IR_CHUNK_TIER);
+    SF_Handle forged = _encode_handle(_handle_pool(stable), _handle_epoch(stable),
+                                      _handle_gen(stable), chunk,
+                                      _handle_offset(stable));
 
     CHECK("tier_mismatch_resolve", hybrid_str(hp, forged, NULL) == NULL);
 
@@ -102,17 +109,25 @@ static void test_free_slot_resolution(void) {
     HybridPool *hp = hybrid_create(4, 64, 64);
     SF_Handle stable = hybrid_intern(hp, "free-slot", 9);
     Pool *p = hp->short_pool;
-    uint32_t rank = _handle_rank(stable);
     uint16_t pool_id = _handle_pool(stable);
 
     hybrid_evict(hp, stable);
-    /* Forge a handle for the deleted slot carrying the CURRENT generation,
-     * so the generation check passes and only the deleted state can reject
-     * it. */
-    uint64_t sl = __atomic_load_n(&p->slots[rank], __ATOMIC_ACQUIRE);
-    SF_Handle forged = _encode_handle(rank, IP_SLOT_GEN(sl), pool_id, IR_TIER_T1);
 
-    CHECK("free_slot_resolve", hybrid_str(hp, forged, NULL) == NULL);
+    /* The eviction bumps the LOCATION's generation, so the handle that
+     * pointed at it stops resolving. */
+    CHECK("free_slot_resolve", hybrid_str(hp, stable, NULL) == NULL);
+
+    /* A handle forged with the location's CURRENT generation resolves to
+     * the bytes that are still there: the bytes are only invalidated, never
+     * erased. */
+    uint16_t chunk = _handle_chunk(stable);
+    uint8_t index = (uint8_t)(chunk & IR_CHUNK_INDEX);
+    const IpPrefix *pfx = (const IpPrefix *)(p->t1.chunks[index]->data +
+                                             _handle_offset(stable));
+    SF_Handle forged = _encode_handle(pool_id, _handle_epoch(stable),
+                                      (uint16_t)IP_PREFIX_GEN(pfx), chunk,
+                                      _handle_offset(stable));
+    CHECK("evicted_bytes_still_readable", hybrid_str(hp, forged, NULL) != NULL);
 
     hybrid_destroy(hp);
 }
