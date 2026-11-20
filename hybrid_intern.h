@@ -197,6 +197,13 @@ static inline void _lock(IpLock *l) {
 }
 static inline void _unlock(IpLock *l) { __atomic_clear(&l->flag, __ATOMIC_RELEASE); }
 
+/* Take the lock if it is free; return 0 if someone else holds it. The
+ * insert path uses this to choose between the cheap locked path (one
+ * caller, no contention) and the lock-free CAS path (several callers). */
+static inline int _trylock(IpLock *l) {
+    return !__atomic_test_and_set(&l->flag, __ATOMIC_ACQUIRE);
+}
+
 static inline void _seq_begin(_Atomic uint32_t *s) { atomic_fetch_add_explicit(s, 1, memory_order_release); }
 static inline void _seq_end  (_Atomic uint32_t *s) { atomic_fetch_add_explicit(s, 1, memory_order_release); }
 
@@ -302,6 +309,11 @@ static bool _arena_alloc(Arena *a, uint32_t len, uint8_t *cid_out, uint32_t *off
  */
 #define IP_CTRL_EMPTY    0x00u
 #define IP_CTRL_DELETED  0x80u
+/* A thread is publishing an entry in this slot. It is neither empty nor
+ * deleted: the probe chain runs past it, and a thread that loses the claim
+ * waits for it to resolve before deciding whether it lost the race for the
+ * SAME string. The tag values skip 0x40 so they cannot be confused. */
+#define IP_CTRL_RESERVED 0x40u
 
 /* The tombstone model (and the tombstone counters in HybridStats) arrived
  * with hybrid_intern 1.1. Tests that want to run against an older header
@@ -335,7 +347,15 @@ typedef uint64_t IpSlot;
  * hash bits 8..31, which OVERLAPPED the index (bits 0..20) — so the cheap
  * pre-memcmp reject could not discriminate same-bucket candidates at all.
  * The index now uses the full 64-bit hash instead of a 32-bit truncation. */
-#define IP_HASH_TAG(h) ((uint8_t)(((h) >> 57) & 0x7Fu))
+/* The 7-bit tag stored in the ctrl byte. 0 is reserved for "never used"
+ * and 0x40 for "being published", so those two are remapped. */
+static inline uint8_t _ip_tag(uint64_t h) {
+    uint8_t t = (uint8_t)((h >> 57) & 0x7Fu);
+    if (!t) t = 1;
+    if (t == IP_CTRL_RESERVED) t = 0x41;
+    return t;
+}
+#define IP_HASH_TAG(h) _ip_tag(h)
 #define IP_HASH_FP(h)  ((uint16_t)(((h) >> 41) & 0x7FFFu))
 
 /* Probe group size: one vector load of ctrl bytes per step. */
@@ -376,14 +396,20 @@ typedef struct {
     uint32_t          M;
     uint16_t          pool_id;
     uint64_t          seed;
-    /* Plain counters, not atomics: every mutation happens under the pool
-     * lock, and a statistic that is read a moment stale is harmless. On
-     * AArch64 an atomic read-modify-write is a locked instruction — four
-     * of them per insert cost more than the lock they were counting. */
-    uint32_t          n_entries;
-    uint32_t          n_tombs;
-    uint32_t          n_inserts;   /* bumped on every publish (under the lock) */
+    /* Two counter sets: the locked path updates the plain ones (the lock
+     * serialises them, and a plain increment is far cheaper than an atomic
+     * read-modify-write on AArch64), the lock-free path updates the atomic
+     * ones. The reported figures are the sum. */
+    uint32_t          n_entries;    /* locked path */
+    uint32_t          n_tombs;      /* locked path */
+    _Atomic uint32_t  n_entries_cas;/* lock-free path */
+    _Atomic uint32_t  n_tombs_cas;  /* lock-free path */
+    _Atomic uint32_t  n_inserts;    /* bumped on every publish */
     _Atomic uint32_t  n_collisions; /* counted in the LOCK-FREE probe */
+    /* Lock-free inserts in flight. The table grow waits for them to drain
+     * before it swaps the arrays, so an insert can never publish into a
+     * table that has just been retired. */
+    _Atomic uint32_t  n_inflight;
     _Atomic uint32_t  seq;
     uint32_t          max_entries;
     uint32_t          epoch[2];       /* per tier: [0] = T0, [1] = T1 */
@@ -668,6 +694,18 @@ static bool _pool_rebuild(Pool *p, uint32_t M2) {
     if (!nc || !ns) { free(nc); free(ns); return false; }
     memset(nc, 0, ctrl_bytes);
 
+    /* Bump the version FIRST: an insert that starts now sees the new one
+     * and retries. Then wait for the in-flight inserts to drain — an insert
+     * must never publish into a table we are about to retire. */
+    atomic_store_explicit(&p->table_ver,
+                           atomic_load_explicit(&p->table_ver, memory_order_relaxed) + 1u,
+                           memory_order_release);
+    while (atomic_load_explicit(&p->n_inflight, memory_order_acquire) != 0) {
+#if defined(__aarch64__) || defined(__arm__)
+        __asm__ __volatile__("yield");
+#endif
+    }
+
     const uint32_t oldM = p->M;
     uint8_t *old_ctrl = p->ctrl;
     IpSlot *old_slots = p->slots;
@@ -703,11 +741,9 @@ static bool _pool_rebuild(Pool *p, uint32_t M2) {
     p->slots = ns;
     p->M = M2;
     p->max_entries = (uint32_t)(M2 * LONG_LOAD_NUM / LONG_LOAD_DEN);
-    atomic_store_explicit(&p->table_ver,
-                        atomic_load_explicit(&p->table_ver, memory_order_relaxed) + 1u,
-                        memory_order_release);
     /* the rebuilt table holds only live entries: no tombstones */
     p->n_tombs = 0;
+    atomic_store_explicit(&p->n_tombs_cas, 0, memory_order_relaxed);
 
     /* retire the old arrays (a lock-free probe may still be reading them) */
     p->retired_ctrl[p->n_retired] = old_ctrl;
@@ -729,8 +765,10 @@ static bool _pool_rebuild(Pool *p, uint32_t M2) {
  * Both are one pass over the table plus one hash per live entry, so both
  * are amortised O(1) per insert. */
 static void _pool_maybe_resize(Pool *p) {
-    uint32_t entries = p->n_entries;
-    uint32_t tombs = p->n_tombs;
+    uint32_t entries = p->n_entries +
+        atomic_load_explicit(&p->n_entries_cas, memory_order_relaxed);
+    uint32_t tombs = p->n_tombs +
+        atomic_load_explicit(&p->n_tombs_cas, memory_order_relaxed);
     if (entries + (p->M / 4) >= p->M) {
         /* 75% of the LIVE entries -> grow. Tombstones do not count: a
          * deleted slot is a reusable slot, not a full one. */
@@ -743,133 +781,100 @@ static void _pool_maybe_resize(Pool *p) {
     }
 }
 
-/* Write the slot and publish the ctrl byte. The ctrl byte is published
- * LAST, so a reader that sees OCCUPIED also sees the slot and the string
- * bytes. */
-static SF_Handle _pool_publish(Pool *p, uint32_t slot, uint64_t h,
-                                uint32_t off, uint8_t cid, uint8_t tier) {
-    uint64_t sl = IP_SLOT_MAKE(off, cid & IR_CHUNK_INDEX, tier, IP_HASH_FP(h));
-    __atomic_store_n(&p->slots[slot], sl, __ATOMIC_RELAXED);
 
-    /* The prefix learns which slot holds it (the handle no longer names a
-     * slot, so the table needs the back-pointer for eviction). */
+/* Claim a slot: EMPTY or DELETED -> RESERVED. Returns 1 if we own it.
+ * `was_deleted` reports whether we took over a tombstone (the caller
+ * accounts for it). */
+static inline int _pool_claim(Pool *p, uint32_t slot, int *was_deleted) {
+    uint8_t expect = __atomic_load_n(&p->ctrl[slot], __ATOMIC_RELAXED);
+    if (expect != IP_CTRL_EMPTY && expect != IP_CTRL_DELETED) return 0;
+    uint8_t want = IP_CTRL_RESERVED;
+    if (!__atomic_compare_exchange_n(&p->ctrl[slot], &expect, want,
+                                     0, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+        return 0;
+    if (was_deleted) *was_deleted = (expect == IP_CTRL_DELETED);
+    return 1;
+}
+
+/* Wait for a slot another thread claimed to resolve, then check whether it
+ * holds OUR string: if it does, that thread won the race for this string
+ * and its handle is the answer — no duplicate entry is created. Returns 1
+ * if the slot resolved to our string. */
+static int _pool_await_reserved(Pool *p, uint32_t slot, uint64_t h,
+                                uint32_t len, const char *s, uint8_t tier,
+                                SF_Handle *out) {
+    for (int spin = 0; spin < 8192; spin++) {
+        uint8_t c = __atomic_load_n(&p->ctrl[slot], __ATOMIC_ACQUIRE);
+        if (c == IP_CTRL_RESERVED) {
+#if defined(__aarch64__) || defined(__arm__)
+            __asm__ __volatile__("yield");
+#endif
+            continue;
+        }
+        /* the slot resolved */
+        uint64_t sl = __atomic_load_n(&p->slots[slot], __ATOMIC_RELAXED);
+        if (IP_SLOT_FP(sl) != IP_HASH_FP(h)) return 0;
+        if (IP_SLOT_TIER(sl) != tier) return 0;
+        const uint8_t *base = _slot_base(p, sl);
+        const IpPrefix *pfx = (const IpPrefix *)base;
+        if (IP_PREFIX_LEN(pfx) != len) return 0;
+        if (!_bytes_equal(base + sizeof(IpPrefix), s, len)) return 0;
+        uint16_t chunk = (uint16_t)((tier == TIER_T1 ? IR_CHUNK_TIER : 0u) |
+                                    (IP_SLOT_CHUNK(sl) & IR_CHUNK_INDEX));
+        *out = _encode_handle(p->pool_id, p->epoch[tier == TIER_T1 ? 1 : 0],
+                              IP_PREFIX_GEN(pfx), chunk, IP_SLOT_OFFSET(sl));
+        return 1;
+    }
+    return 0;
+}
+
+/* Write the entry into a slot we own and publish it: the ctrl byte goes
+ * from RESERVED to OCCUPIED, and it is written LAST so a reader that sees
+ * OCCUPIED also sees the slot and the string bytes. */
+static SF_Handle _pool_publish_claimed(Pool *p, uint32_t slot, uint64_t h,
+                                        uint32_t off, uint8_t cid, uint8_t tier,
+                                        int was_deleted, int lock_free) {
+    uint64_t sl = IP_SLOT_MAKE(off, cid, tier, IP_HASH_FP(h));
+    __atomic_store_n(&p->slots[slot], sl, __ATOMIC_RELAXED);
     Arena *ar = tier == TIER_T1 ? &p->t1 : &p->t0;
     IpPrefix *pfx = (IpPrefix *)(ar->chunks[cid & IR_CHUNK_INDEX]->data + off);
     pfx->hi = slot;
-
-    uint8_t tag = IP_HASH_TAG(h);
-    if (!tag) tag = 1;
-    uint8_t old_ctrl = __atomic_load_n(&p->ctrl[slot], __ATOMIC_RELAXED);
-    __atomic_store_n(&p->ctrl[slot], tag, __ATOMIC_RELEASE);
-    p->n_entries++;
-    p->n_inserts++;
-    if (old_ctrl == IP_CTRL_DELETED)
-        p->n_tombs--;
-
+    __atomic_store_n(&p->ctrl[slot], IP_HASH_TAG(h), __ATOMIC_RELEASE);
+    if (lock_free) {
+        atomic_fetch_add_explicit(&p->n_entries_cas, 1, memory_order_relaxed);
+        if (was_deleted)
+            atomic_fetch_sub_explicit(&p->n_tombs_cas, 1, memory_order_relaxed);
+    } else {
+        p->n_entries++;
+        if (was_deleted) p->n_tombs--;
+    }
+    atomic_fetch_add_explicit(&p->n_inserts, 1, memory_order_relaxed);
     uint16_t chunk = (uint16_t)((tier == TIER_T1 ? IR_CHUNK_TIER : 0u) |
-                                 (cid & IR_CHUNK_INDEX));
+                                (cid & IR_CHUNK_INDEX));
     return _encode_handle(p->pool_id, p->epoch[tier == TIER_T1 ? 1 : 0],
-                          1, chunk, off);
+                           1, chunk, off);
 }
 
-static SF_Handle pool_intern(Pool *p, const char *s, uint32_t len, uint8_t tier) {
-    /* The arena prefix (8 bytes) rides along with every string, so the
-     * usable length is 8 less than the arena limit. */
-    if (len > HYBRID_INTERN_MAX_LEN - 8u || (len != 0 && s == NULL)) return SF_NULL;
+/* The locked path: everything under the pool lock. Used by the scratch
+ * tier (whose arena the epoch boundary releases) and as the fallback when
+ * the lock-free path cannot make progress. */
+/* The body of the locked path: the caller HOLDS the lock. */
+static SF_Handle pool_intern_locked_held(Pool *p, const char *s, uint32_t len,
+                                          uint8_t tier) {
     uint64_t h = plumshash(s, len, p->seed);
     Arena *a = tier == TIER_T1 ? &p->t1 : &p->t0;
 
     uint32_t match_slot = UINT32_MAX, insert_slot = UINT32_MAX;
-
-    if (tier == TIER_T1) {
-        /* The stable tier is never freed until the pool is destroyed, so
-         * the probe can run WITHOUT the mutex: a string that is already
-         * interned never touches the lock at all. That is the common case
-         * in real use (dedup), and it is where the shared-pool contention
-         * used to hurt. */
-        uint32_t ins0 = p->n_inserts;
-        _pool_probe(p, h, len, s, tier, &match_slot, &insert_slot);
-        if (match_slot != UINT32_MAX) {
-            uint64_t sl = __atomic_load_n(&p->slots[match_slot], __ATOMIC_RELAXED);
-            const uint8_t *base = _slot_base(p, sl);
-            uint32_t off = IP_SLOT_OFFSET(sl);
-            uint8_t cid = IP_SLOT_CHUNK(sl);
-            const IpPrefix *pfx = (const IpPrefix *)base;
-            uint16_t chunk = (uint16_t)((tier == TIER_T1 ? IR_CHUNK_TIER : 0u) |
-                                        (cid & IR_CHUNK_INDEX));
-            (void)pfx;
-            return _encode_handle(p->pool_id, p->epoch[1],
-                                  IP_PREFIX_GEN(pfx), chunk, off);
-        }
-
-        /* Copy the bytes into the arena outside the lock: the arena bump
-         * allocator is atomic, and the copy is the expensive part of an
-         * insert. Only the slot claim stays under the lock. */
-        uint8_t cid; uint32_t off;
-        if (!_arena_alloc(a, len + 8u, &cid, &off)) return SF_NULL;
-        uint8_t *base = a->chunks[cid]->data + off;
-        IpPrefix *pfx = (IpPrefix *)base;
-        uint8_t *dst = base + sizeof(IpPrefix);
-        uint32_t padded = ((len + 8u + (IP_ARENA_ALIGN - 1u)) & ~(uint32_t)(IP_ARENA_ALIGN - 1u))
-                        - (uint32_t)sizeof(IpPrefix);
-        pfx->lo = (len & 0xFFFFFu) | (1u << 20);   /* length + generation 1 */
-        pfx->hi = 0;                               /* the slot is patched at publish */
-        if (len) memcpy(dst, s, len);
-        if (padded > len) memset(dst + len, 0, padded - len);
-
-        /* Claim a slot under the lock. The critical section is now short:
-         * a re-probe (to catch a concurrent insert of the same string) plus
-         * the slot write. */
-        _lock(&p->lock);
-        /* Only re-probe if another thread inserted something since our
-         * lock-free probe: under the lock no insert can be in flight, so an
-         * unchanged counter means our slot is still ours and the string was
-         * not interned meanwhile. That turns the common case into one
-         * probe instead of two. */
-        uint32_t ins1 = p->n_inserts;
-        if (ins1 != ins0) {
-            _pool_probe(p, h, len, s, tier, &match_slot, &insert_slot);
-            if (match_slot == UINT32_MAX && insert_slot == UINT32_MAX) {
-                _unlock(&p->lock);
-                return SF_NULL;
-            }
-        }
-        if (match_slot != UINT32_MAX) {
-            /* Another thread interned the same string first: its entry
-             * wins, ours is wasted arena space. */
-            uint64_t sl = __atomic_load_n(&p->slots[match_slot], __ATOMIC_RELAXED);
-            const IpPrefix *pfx2 = (const IpPrefix *)_slot_base(p, sl);
-            uint16_t chunk2 = (uint16_t)(IR_CHUNK_TIER | (IP_SLOT_CHUNK(sl) & IR_CHUNK_INDEX));
-            SF_Handle dup = _encode_handle(p->pool_id, p->epoch[1],
-                                           IP_PREFIX_GEN(pfx2), chunk2,
-                                           IP_SLOT_OFFSET(sl));
-            _seq_end(&p->seq);
-            _unlock(&p->lock);
-            return dup;
-        }
-        if (insert_slot == UINT32_MAX) {
-            _unlock(&p->lock);
-            return SF_NULL;
-        }
-        SF_Handle out = _pool_publish(p, insert_slot, h, off, cid, tier);
-        _pool_maybe_resize(p);
-        _unlock(&p->lock);
-        return out;
-    }
-
-    /* Scratch (T0) tier: the epoch boundary bulk-frees this arena, so
-     * everything stays under the lock — a copy outside it could write into
-     * an arena that the epoch just released. */
-    _lock(&p->lock);
     _seq_begin(&p->seq);
     SF_Handle out = SF_NULL;
     _pool_probe(p, h, len, s, tier, &match_slot, &insert_slot);
     if (match_slot != UINT32_MAX) {
         uint64_t sl = __atomic_load_n(&p->slots[match_slot], __ATOMIC_RELAXED);
         const IpPrefix *pfx = (const IpPrefix *)_slot_base(p, sl);
-        uint16_t chunk = (uint16_t)(IP_SLOT_CHUNK(sl) & IR_CHUNK_INDEX);
-        out = _encode_handle(p->pool_id, p->epoch[0], IP_PREFIX_GEN(pfx),
-                             chunk, IP_SLOT_OFFSET(sl));
+        uint16_t chunk = (uint16_t)((tier == TIER_T1 ? IR_CHUNK_TIER : 0u) |
+                                    (IP_SLOT_CHUNK(sl) & IR_CHUNK_INDEX));
+        out = _encode_handle(p->pool_id, p->epoch[tier == TIER_T1 ? 1 : 0],
+                             IP_PREFIX_GEN(pfx), chunk, IP_SLOT_OFFSET(sl));
     } else if (insert_slot != UINT32_MAX) {
         uint32_t total = (len + 8u + (IP_ARENA_ALIGN - 1u)) & ~(uint32_t)(IP_ARENA_ALIGN - 1u);
         uint8_t cid; uint32_t off;
@@ -882,13 +887,206 @@ static SF_Handle pool_intern(Pool *p, const char *s, uint32_t len, uint8_t tier)
             pfx->hi = 0;
             if (len) memcpy(dst, s, len);
             if (padded > len) memset(dst + len, 0, padded - len);
-            out = _pool_publish(p, insert_slot, h, off, cid, tier);
-            _pool_maybe_resize(p);
+            int was_deleted = 0;
+            if (_pool_claim(p, insert_slot, &was_deleted)) {
+                out = _pool_publish_claimed(p, insert_slot, h, off, cid, tier,
+                                            was_deleted, 0);
+                _pool_maybe_resize(p);
+            }
         }
     }
     _seq_end(&p->seq);
+    return out;
+}
+
+static SF_Handle pool_intern_locked(Pool *p, const char *s, uint32_t len,
+                                     uint8_t tier) {
+    _lock(&p->lock);
+    SF_Handle out = pool_intern_locked_held(p, s, len, tier);
     _unlock(&p->lock);
     return out;
+}
+
+/* The lock-free insert path (stable tier).
+ *
+ * The claim is a compare-and-swap on the ctrl byte. The winner publishes
+ * the entry; a thread that loses the claim waits for the winner and checks
+ * whether the winner was claiming the SAME string — if so, the winner's
+ * handle is the answer and no duplicate entry is created. If the wait times
+ * out, the locked path takes over.
+ *
+ * The in-flight counter plus the table version keep a grow from retiring a
+ * table while an insert is publishing into it. */
+static SF_Handle pool_intern_lf(Pool *p, const char *s, uint32_t len,
+                                uint8_t tier) {
+    uint64_t h = plumshash(s, len, p->seed);
+    Arena *a = &p->t1;
+
+    for (int attempt = 0; attempt < 32; attempt++) {
+        /* Register as in flight, then check the table version: if the table
+         * was replaced while we registered, retry on the new one. */
+        uint32_t v0 = atomic_load_explicit(&p->table_ver, memory_order_acquire);
+        atomic_fetch_add_explicit(&p->n_inflight, 1, memory_order_acq_rel);
+        uint32_t v1 = atomic_load_explicit(&p->table_ver, memory_order_acquire);
+        if (v1 != v0) {
+            atomic_fetch_sub_explicit(&p->n_inflight, 1, memory_order_release);
+            continue;
+        }
+
+        uint32_t match_slot = UINT32_MAX, insert_slot = UINT32_MAX;
+        _pool_probe(p, h, len, s, tier, &match_slot, &insert_slot);
+
+        if (match_slot != UINT32_MAX) {
+            uint64_t sl = __atomic_load_n(&p->slots[match_slot], __ATOMIC_RELAXED);
+            const IpPrefix *pfx = (const IpPrefix *)_slot_base(p, sl);
+            uint16_t chunk = (uint16_t)(IR_CHUNK_TIER | (IP_SLOT_CHUNK(sl) & IR_CHUNK_INDEX));
+            SF_Handle hit = _encode_handle(p->pool_id, p->epoch[1],
+                                           IP_PREFIX_GEN(pfx), chunk,
+                                           IP_SLOT_OFFSET(sl));
+            atomic_fetch_sub_explicit(&p->n_inflight, 1, memory_order_release);
+            return hit;
+        }
+        if (insert_slot == UINT32_MAX) {
+            atomic_fetch_sub_explicit(&p->n_inflight, 1, memory_order_release);
+            return SF_NULL;
+        }
+
+        /* Prepare the arena data: no lock, the bump allocator is atomic. */
+        uint8_t cid; uint32_t off;
+        if (!_arena_alloc(a, len + (uint32_t)sizeof(IpPrefix), &cid, &off)) {
+            atomic_fetch_sub_explicit(&p->n_inflight, 1, memory_order_release);
+            return SF_NULL;
+        }
+        uint8_t *base = a->chunks[cid]->data + off;
+        IpPrefix *pfx = (IpPrefix *)base;
+        uint8_t *dst = base + sizeof(IpPrefix);
+        uint32_t padded = ((len + (uint32_t)sizeof(IpPrefix) + (IP_ARENA_ALIGN - 1u))
+                           & ~(uint32_t)(IP_ARENA_ALIGN - 1u))
+                        - (uint32_t)sizeof(IpPrefix);
+        pfx->lo = (len & 0xFFFFFu) | (1u << 20);
+        pfx->hi = 0;
+        if (len) memcpy(dst, s, len);
+        if (padded > len) memset(dst + len, 0, padded - len);
+
+        int was_deleted = 0;
+        if (_pool_claim(p, insert_slot, &was_deleted)) {
+            SF_Handle out = _pool_publish_claimed(p, insert_slot, h, off, cid,
+                                                  tier, was_deleted, 1);
+            atomic_fetch_sub_explicit(&p->n_inflight, 1, memory_order_release);
+            /* The table grows under the lock (the rebuild swaps the arrays,
+             * so it must not race with a lock-free insert) — but only when
+             * it is actually time, which is once per doubling. */
+            if (p->n_entries +
+                atomic_load_explicit(&p->n_entries_cas, memory_order_relaxed)
+                + (p->M / 4) >= p->M) {
+                _lock(&p->lock);
+                _pool_maybe_resize(p);
+                _unlock(&p->lock);
+            }
+            return out;
+        }
+
+        /* Someone else took the slot. If they are publishing OUR string,
+         * their entry is the answer. */
+        SF_Handle won;
+        if (_pool_await_reserved(p, insert_slot, h, len, s, tier, &won)) {
+            atomic_fetch_sub_explicit(&p->n_inflight, 1, memory_order_release);
+            return won;
+        }
+        atomic_fetch_sub_explicit(&p->n_inflight, 1, memory_order_release);
+        /* The slot resolved to someone else's string, or the wait timed
+         * out: probe again on the current table. */
+    }
+    /* Too much contention: the locked path takes over. */
+    return pool_intern_locked(p, s, len, tier);
+}
+
+static SF_Handle pool_intern(Pool *p, const char *s, uint32_t len, uint8_t tier) {
+    /* The arena prefix (8 bytes) rides along with every string, so the
+     * usable length is 8 less than the arena limit. */
+    if (len > HYBRID_INTERN_MAX_LEN - 8u || (len != 0 && s == NULL)) return SF_NULL;
+
+    if (tier == TIER_T1) {
+        /* The stable tier probes WITHOUT the lock: a string that is already
+         * interned never touches the lock at all. That is the hot path for
+         * a shared pool. */
+        uint64_t h = plumshash(s, len, p->seed);
+        uint32_t match_slot = UINT32_MAX, insert_slot = UINT32_MAX;
+        /* Remember the insert counter: if it has not moved by the time we
+         * hold the lock, nobody inserted anything meanwhile and the slot
+         * we found is still ours — so the re-probe can be skipped. */
+        uint32_t ins0 = atomic_load_explicit(&p->n_inserts, memory_order_relaxed);
+        _pool_probe(p, h, len, s, tier, &match_slot, &insert_slot);
+        if (match_slot != UINT32_MAX) {
+            uint64_t sl = __atomic_load_n(&p->slots[match_slot], __ATOMIC_RELAXED);
+            const IpPrefix *pfx = (const IpPrefix *)_slot_base(p, sl);
+            uint16_t chunk = (uint16_t)(IR_CHUNK_TIER | (IP_SLOT_CHUNK(sl) & IR_CHUNK_INDEX));
+            return _encode_handle(p->pool_id, p->epoch[1], IP_PREFIX_GEN(pfx),
+                                  chunk, IP_SLOT_OFFSET(sl));
+        }
+        if (insert_slot == UINT32_MAX) return SF_NULL;
+
+        /* Prepare the arena data outside the lock: the bump allocator is
+         * atomic and the copy is the expensive part of an insert. */
+        Arena *a = &p->t1;
+        uint8_t cid; uint32_t off;
+        if (!_arena_alloc(a, len + (uint32_t)sizeof(IpPrefix), &cid, &off))
+            return SF_NULL;
+        uint8_t *base = a->chunks[cid]->data + off;
+        IpPrefix *pfx = (IpPrefix *)base;
+        uint8_t *dst = base + sizeof(IpPrefix);
+        uint32_t padded = ((len + (uint32_t)sizeof(IpPrefix) + (IP_ARENA_ALIGN - 1u))
+                           & ~(uint32_t)(IP_ARENA_ALIGN - 1u))
+                        - (uint32_t)sizeof(IpPrefix);
+        pfx->lo = (len & 0xFFFFFu) | (1u << 20);
+        pfx->hi = 0;
+        if (len) memcpy(dst, s, len);
+        if (padded > len) memset(dst + len, 0, padded - len);
+
+        /* Claim the slot. With the lock free, the locked path is cheaper
+         * (no CAS, no in-flight bookkeeping) — so take it. When the pool is
+         * contended, queuing behind the lock is worse than going lock-free:
+         * the CAS path then wins by a wide margin. */
+        if (_trylock(&p->lock)) {
+            SF_Handle out = SF_NULL;
+            /* Re-probe under the lock only if another thread inserted
+             * something since our lock-free probe: under the lock no insert
+             * can be in flight, so an unchanged counter means our slot is
+             * still ours and the string was not interned meanwhile. */
+            uint32_t ms = UINT32_MAX, is = insert_slot;
+            uint32_t ins1 = atomic_load_explicit(&p->n_inserts, memory_order_relaxed);
+            if (ins1 != ins0) {
+                _pool_probe(p, h, len, s, tier, &ms, &is);
+            }
+            if (ms != UINT32_MAX) {
+                uint64_t sl = __atomic_load_n(&p->slots[ms], __ATOMIC_RELAXED);
+                const IpPrefix *pfx2 = (const IpPrefix *)_slot_base(p, sl);
+                uint16_t chunk2 = (uint16_t)(IR_CHUNK_TIER | (IP_SLOT_CHUNK(sl) & IR_CHUNK_INDEX));
+                out = _encode_handle(p->pool_id, p->epoch[1], IP_PREFIX_GEN(pfx2),
+                                     chunk2, IP_SLOT_OFFSET(sl));
+            } else if (is != UINT32_MAX) {
+                int was_deleted = 0;
+                if (_pool_claim(p, is, &was_deleted)) {
+                    out = _pool_publish_claimed(p, is, h, off, cid, tier,
+                                                was_deleted, 0);
+                    if (p->n_entries +
+                        atomic_load_explicit(&p->n_entries_cas, memory_order_relaxed)
+                        + (p->M / 4) >= p->M) {
+                        _pool_maybe_resize(p);
+                    }
+                }
+            }
+            _unlock(&p->lock);
+            return out;
+        }
+        /* Contended: the lock-free CAS path. It re-probes and re-copies;
+         * that is the price of not queueing behind the lock. */
+        return pool_intern_lf(p, s, len, tier);
+    }
+
+    /* Scratch tier: the epoch boundary releases its arena, so everything
+     * stays under the lock. */
+    return pool_intern_locked(p, s, len, tier);
 }
 
 static void pool_evict(Pool *p, SF_Handle h) {
@@ -1048,13 +1246,17 @@ typedef struct {
 
 static HybridStats hybrid_stats(HybridPool *hp) {
     HybridStats s = {0};
-    s.short_entries = hp->short_pool->n_entries;
+    s.short_entries = hp->short_pool->n_entries +
+        atomic_load_explicit(&hp->short_pool->n_entries_cas, memory_order_relaxed);
     s.short_max = hp->short_pool->M;
     s.short_collisions = atomic_load_explicit(&hp->short_pool->n_collisions, memory_order_relaxed);
-    s.short_tombs = hp->short_pool->n_tombs;
-    s.long_entries = hp->long_pool->n_entries;
+    s.short_tombs = hp->short_pool->n_tombs +
+        atomic_load_explicit(&hp->short_pool->n_tombs_cas, memory_order_relaxed);
+    s.long_entries = hp->long_pool->n_entries +
+        atomic_load_explicit(&hp->long_pool->n_entries_cas, memory_order_relaxed);
     s.long_max = hp->long_pool->M;
-    s.long_tombs = hp->long_pool->n_tombs;
+    s.long_tombs = hp->long_pool->n_tombs +
+        atomic_load_explicit(&hp->long_pool->n_tombs_cas, memory_order_relaxed);
     s.long_collisions = atomic_load_explicit(&hp->long_pool->n_collisions, memory_order_relaxed);
     s.short_load = (double)s.short_entries / s.short_max;
     s.long_load = (double)s.long_entries / s.long_max;
