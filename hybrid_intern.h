@@ -218,7 +218,20 @@ static bool _arena_alloc(Arena *a, uint32_t len, uint8_t *cid_out, uint32_t *off
 /* ----------------------------------------------------------------------
  * POOL — slot-indexed headers + T0/T1 arenas + fingerprint
  * ---------------------------------------------------------------------- */
-typedef enum : uint8_t { LK_FREE = 0, LK_OWNED = 1 } EntryKind;
+/* Slot state.
+ *
+ * LK_TOMB is a deleted slot. The probe chain runs PAST it — only LK_FREE
+ * ends a chain — but a later insert on the same chain may reuse it. Without
+ * the tombstone, freeing a slot cuts the chain: a lookup for a string that
+ * lives further down the same chain stops at the hole and never finds it,
+ * so the re-intern inserts a DUPLICATE instead of resolving the existing
+ * entry. */
+typedef enum : uint8_t { LK_FREE = 0, LK_OWNED = 1, LK_TOMB = 2 } EntryKind;
+
+/* The tombstone model (and the tombstone counters in HybridStats) arrived
+ * with hybrid_intern 1.1. Tests that want to run against an older header
+ * can test this macro to skip the counters. */
+#define HYBRID_INTERN_HAS_TOMBSTONES 1
 enum { TIER_T0 = 0, TIER_T1 = 1 };
 
 typedef struct __attribute__((aligned(4))) {
@@ -241,6 +254,7 @@ typedef struct {
     uint16_t          pool_id;
     uint64_t          seed;
     _Atomic uint32_t  n_entries;
+    _Atomic uint32_t  n_tombs;
     _Atomic uint32_t  n_collisions;
     _Atomic uint32_t  seq;
     uint32_t          max_entries;
@@ -340,12 +354,27 @@ static SF_Handle pool_intern(Pool *p, const char *s, uint32_t len, uint8_t tier)
     _lock(&p->lock);
     _seq_begin(&p->seq);
     SF_Handle out = SF_NULL;
+    uint32_t first_tomb = UINT32_MAX;   /* earliest deleted slot on this chain */
     for (uint32_t probe = 0; probe < p->M; probe++) {
         uint32_t p2 = (pos + probe) & (p->M - 1);
         Entry *eh = &p->headers[p2];
         uint64_t hdr = __atomic_load_n((uint64_t *)eh, __ATOMIC_RELAXED);
+        uint8_t kind = (uint8_t)(hdr >> 32);
 
-        if (((uint8_t)(hdr >> 32)) == LK_FREE) {
+        if (kind == LK_TOMB) {
+            /* Deleted slot: keep walking the chain, but remember it so the
+             * insert below can reuse it instead of growing the table. */
+            if (first_tomb == UINT32_MAX) first_tomb = p2;
+            atomic_fetch_add_explicit(&p->n_collisions, 1, memory_order_relaxed);
+            continue;
+        }
+
+        if (kind == LK_FREE) {
+            /* Claim the earliest tombstone we passed, else this free slot. */
+            uint32_t slot = (first_tomb != UINT32_MAX) ? first_tomb : p2;
+            Entry *target = &p->headers[slot];
+            uint64_t thdr = __atomic_load_n((uint64_t *)target, __ATOMIC_RELAXED);
+
             uint8_t cid; uint32_t off;
             if (!_arena_alloc(a, len, &cid, &off)) break;
             uint8_t *dst = a->chunks[cid]->data + off;
@@ -354,7 +383,7 @@ static SF_Handle pool_intern(Pool *p, const char *s, uint32_t len, uint8_t tier)
             if (padded == 0) padded = 32;
             if (padded > len) memset(dst + len, 0, padded - len);
 
-            uint8_t gen = (uint8_t)(hdr & 0xFF) + 1;
+            uint8_t gen = (uint8_t)(thdr & 0xFF) + 1;
             if (gen == 0) gen = 1;
 
             Entry ne = {0};
@@ -364,12 +393,15 @@ static SF_Handle pool_intern(Pool *p, const char *s, uint32_t len, uint8_t tier)
             ne.chunk_id = cid;
             ne.offset = off;
             ne.tier = tier;
-            _store_header(eh, &ne);
+            _store_header(target, &ne);
             atomic_fetch_add_explicit(&p->n_entries, 1, memory_order_relaxed);
-            out = _encode_handle(p2, gen, p->pool_id, tier == TIER_T1 ? IR_TIER_T1 : IR_TIER_T0);
+            if (slot != p2)
+                atomic_fetch_sub_explicit(&p->n_tombs, 1, memory_order_relaxed);
+            out = _encode_handle(slot, gen, p->pool_id, tier == TIER_T1 ? IR_TIER_T1 : IR_TIER_T0);
             break;
         }
 
+        /* LK_OWNED */
         uint32_t hg = (uint32_t)hdr;
         uint64_t hdr1 = __atomic_load_n((uint64_t *)eh + 1, __ATOMIC_RELAXED);
         uint32_t elen = (uint32_t)hdr1;
@@ -402,10 +434,15 @@ static void pool_evict(Pool *p, SF_Handle h) {
     if (((uint8_t)(hdr >> 32)) == LK_OWNED && (uint8_t)hdr == gen &&
         entry_tier == expected_entry_tier) {
         uint8_t ng = (uint8_t)(hdr & 0xFF) + 1; if (ng == 0) ng = 1;
-        uint64_t nhdr = (hdr & ~0xFFull) | ng;   /* bump gen */
-        nhdr &= ~(0xFFull << 48);                /* kind = LK_FREE */
+        uint64_t nhdr = (hdr & ~0xFFull) | ng;               /* bump gen */
+        /* Tombstone: clear the KIND byte (bits 32..39) and KEEP the tier
+         * byte (bits 48..55). The old code cleared bits 48..55 — the tier —
+         * so the slot stayed LK_OWNED forever and the table leaked until
+         * interning started failing with SF_NULL. */
+        nhdr = (nhdr & ~(0xFFull << 32)) | ((uint64_t)LK_TOMB << 32);
         __atomic_store_n((uint64_t *)eh, nhdr, __ATOMIC_RELEASE);
         atomic_fetch_sub_explicit(&p->n_entries, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&p->n_tombs, 1, memory_order_relaxed);
     }
     _seq_end(&p->seq);
     _unlock(&p->lock);
@@ -453,9 +490,10 @@ static uint32_t pool_epoch_end(Pool *p) {
             (uint8_t)(hdr >> 48) == TIER_T0) {
             uint8_t ng = (uint8_t)(hdr & 0xFF) + 1; if (ng == 0) ng = 1;
             uint64_t nhdr = (hdr & ~0xFFull) | ng;
-            nhdr &= ~(0xFFull << 48);   /* kind = LK_FREE */
+            nhdr = (nhdr & ~(0xFFull << 32)) | ((uint64_t)LK_TOMB << 32);
             __atomic_store_n((uint64_t *)eh, nhdr, __ATOMIC_RELEASE);
             atomic_fetch_sub_explicit(&p->n_entries, 1, memory_order_relaxed);
+            atomic_fetch_add_explicit(&p->n_tombs, 1, memory_order_relaxed);
             cleared++;
         }
     }
@@ -537,6 +575,7 @@ static uint32_t hybrid_epoch_end(HybridPool *hp) {
 typedef struct {
     uint32_t short_entries, short_max;
     uint32_t long_entries, long_max, long_collisions;
+    uint32_t short_tombs, long_tombs;   /* deleted slots awaiting reuse */
     double   short_load, long_load;
 } HybridStats;
 
@@ -544,8 +583,10 @@ static HybridStats hybrid_stats(HybridPool *hp) {
     HybridStats s = {0};
     s.short_entries = atomic_load_explicit(&hp->short_pool->n_entries, memory_order_relaxed);
     s.short_max = hp->short_pool->M;
+    s.short_tombs = atomic_load_explicit(&hp->short_pool->n_tombs, memory_order_relaxed);
     s.long_entries = atomic_load_explicit(&hp->long_pool->n_entries, memory_order_relaxed);
     s.long_max = hp->long_pool->M;
+    s.long_tombs = atomic_load_explicit(&hp->long_pool->n_tombs, memory_order_relaxed);
     s.long_collisions = atomic_load_explicit(&hp->long_pool->n_collisions, memory_order_relaxed);
     s.short_load = (double)s.short_entries / s.short_max;
     s.long_load = (double)s.long_entries / s.long_max;
@@ -556,11 +597,11 @@ static void hybrid_print_stats(HybridPool *hp) {
     HybridStats s = hybrid_stats(hp);
     fprintf(stderr,
         "[HybridPool id=%u]\n"
-        "  Short pool: %u / %u slots (%.1f%%)\n"
-        "  Long pool : %u / %u slots (%.1f%%), collisions=%u\n",
+        "  Short pool: %u / %u slots (%.1f%%), tombstones=%u\n"
+        "  Long pool : %u / %u slots (%.1f%%), tombstones=%u, collisions=%u\n",
         hp->base_pool_id,
-        s.short_entries, s.short_max, s.short_load * 100.0,
-        s.long_entries, s.long_max, s.long_load * 100.0,
+        s.short_entries, s.short_max, s.short_load * 100.0, s.short_tombs,
+        s.long_entries, s.long_max, s.long_load * 100.0, s.long_tombs,
         s.long_collisions);
 }
 

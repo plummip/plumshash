@@ -153,6 +153,17 @@ resolves to `NULL` — never to torn data.
   when the boundary runs. The zero-copy pointer must not be used after that
   boundary; use external quiescence (or a future pinned/copying API) when
   readers and epoch boundaries can overlap.
+- Deleting a slot leaves a **tombstone**: the probe chain runs past it, so a
+  string sitting further down the same chain is still found after a
+  neighbouring entry is evicted or cleared at an epoch boundary (a plain
+  "free" would cut the chain and the re-intern would create a duplicate). The
+  next insert on that chain reuses the deleted slot, so evict/intern churn
+  does not grow the table. `hybrid_stats()` reports live entries and
+  tombstones separately, so the load figure is the truth.
+- The table size is fixed when the pool is created and never grows. A pool
+  asked to hold more live entries than its hint sized it for returns `SF_NULL`
+  from `hybrid_intern()` — size the hint for the peak live set, and expect
+  evicted slots to be reused rather than reclaimed in place.
 
 ### Quick start
 
@@ -183,7 +194,10 @@ interning the same set concurrently (one handle per string, no duplicate
 intern), evict/gen invalidation, and evict-during-resolve (TOCTOU) churn
 against a small pool. `test_hybrid_security` adds malformed-handle,
 full-width-length, oversized-length, pool-id, and AVX2 boundary regressions
-under ASan/UBSan. See [Testing](#testing).
+under ASan/UBSan. `test_hybrid_lifecycle` covers the delete semantics:
+tombstoned slots keep the probe chain intact (dedup survives an eviction),
+the next insert reuses the deleted slot, evict/intern churn never exhausts
+the table, and stale handles resolve `NULL`. See [Testing](#testing).
 
 ## Benchmarks vs the field
 
@@ -326,6 +340,7 @@ the pinning caveat above).
 | `test_extensive` | broad sanity/chi²/avalanche matrix + throughput spot checks |
 | `test_hybrid` | `hybrid_intern.h`: roundtrip/dedup/boundaries, 8-thread concurrent intern of one set, evict/gen invalidation, evict-during-resolve (TOCTOU) |
 | `test_hybrid_security` (ASan/UBSan) | malformed/out-of-range/tier-mismatched/free-slot handles, 65,536-byte length roundtrip/dedup, oversized-length rejection, invalid pool ids, AVX2 tail bounds |
+| `test_hybrid_lifecycle` (ASan/UBSan) | delete semantics: evict/intern churn does not exhaust the table, dedup survives an eviction, deleted slots are reused, scratch tier survives epoch churn, stale handles resolve `NULL` |
 
 Standalone suite, built by `make all` and run by CI:
 

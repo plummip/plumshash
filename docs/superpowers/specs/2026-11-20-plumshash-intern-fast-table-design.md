@@ -126,7 +126,7 @@ Four phases, each independently shippable and gated.
 | **0** | correct delete semantics (tombstones) + regression tests | low |
 | **1** | `bench_hybrid.c` — the measurement harness | none |
 | **2** | table redesign: ctrl array + SIMD group probe + 8-byte slots | medium |
-| **3** | location-carrying handle → 1-miss lookups | medium |
+| **3** | location-carrying handle → 1-miss lookups, table rehashable | medium |
 | **4** | lock-free insert path (CAS), replacing the per-pool mutex | high |
 
 Phase 0 is a prerequisite for the rest: phases 2–4 all rewrite the probe, and
@@ -149,16 +149,18 @@ kind byte:  LK_FREE  (0)    EMPTY    — probe stops here
 ```
 
 - Probe continues past `LK_TOMB` slots; it stops only at `LK_FREE`.
-- Insert reuses the **first** `DELETED` slot found on the chain (so tombstones
-  do not accumulate faster than necessary); otherwise the first `EMPTY`.
-- A rehash into a fresh table of the **same size** runs when
-  `tombstones > M / 4`; it re-inserts the live entries and clears the
-  tombstones. There is deliberately still no *resize* path — `M` is fixed at
-  `pool_create`, so the index of a live string never changes (goal 3). The
-  rehash is invisible to callers: the handle points into the arena, not into
-  the table.
+- Insert reuses the **first** `LK_TOMB` slot found on the chain (so tombstones
+  do not accumulate faster than necessary); otherwise the first `LK_FREE`.
+- **No rehash in this phase.** A rehash re-inserts live entries at new
+  positions, and the handle encodes the slot index — so rehashing would
+  invalidate every live handle. Reclaiming the table therefore waits for
+  phase 3, where the handle names an arena location instead of a slot and the
+  table becomes free to rebuild at any time. Until then the table size is
+  fixed at `pool_create`, tombstones are reused by later inserts, and a pool
+  that runs out of slots reports `SF_NULL` from `hybrid_intern()` rather than
+  silently misbehaving.
 - `pool_evict` clears the **kind** byte (bits 32–39) and marks the slot
-  `DELETED`; `pool_epoch_end` does the same for every T0 slot it clears.
+  `LK_TOMB`; `pool_epoch_end` does the same for every T0 slot it clears.
 - `n_entries` counts live entries; a separate counter tracks tombstones so
   `hybrid_stats` can report load honestly.
 
@@ -309,9 +311,10 @@ own stress test (N threads × the same M strings, assert one entry each).
 - The existing 9 gate binaries stay green, including the ASan/UBSan gate.
 - New `test_hybrid_lifecycle.c` (§4.1) — 4 scenarios, run under ASan/UBSan.
 - New `test_hybrid_table.c` — ctrl/slot/tag layout, group-probe equivalence
-  against a scalar reference probe, tombstone reuse, rehash-on-tombstone-
-  pressure, and index stability (the same string always lands on the same
-  index for a fixed table size and seed).
+  against a scalar reference probe, tombstone reuse, and index stability (the
+  same string always lands on the same index for a fixed table size and
+  seed). The table-rehash case moves to phase 3, where the handle survives a
+  rebuild.
 - The existing `test_hybrid_security.c` keeps covering handle forgery.
 
 **Performance** (in `make bench`, reported in the commit message)
@@ -362,7 +365,7 @@ own stress test (N threads × the same M strings, assert one entry each).
 
 | risk | mitigation |
 |---|---|
-| tombstone/rehash logic breaks dedup | phase 0 lands first, with its own stress test; phase 2 keeps a scalar reference probe to differential-test against |
+| tombstone logic breaks dedup | phase 0 lands first, with its own stress test; phase 2 keeps a scalar reference probe to differential-test against |
 | +25 B/string arena overhead | alignment granularity reduction (§7.3); make it configurable and measure |
 | lock-free insert creates duplicate entries | the phase-4 stress test asserts exactly one entry per string under contention; phase 4 is the only phase that may be descoped |
 | SIMD path diverges from the scalar path | differential test: same input, both probes, identical handles |
