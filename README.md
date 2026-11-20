@@ -166,10 +166,13 @@ opaque: do not read it as a float (it is not NaN-boxed any more).
   next insert on that chain reuses the deleted slot, so evict/intern churn
   does not grow the table. `hybrid_stats()` reports live entries and
   tombstones separately, so the load figure is the truth.
-- The table size is fixed when the pool is created and never grows. A pool
-  asked to hold more live entries than its hint sized it for returns `SF_NULL`
-  from `hybrid_intern()` — size the hint for the peak live set, and expect
-  evicted slots to be reused rather than reclaimed in place.
+- The table **grows**: it doubles when it passes 75% and re-places every live
+  entry (each is re-hashed from its bytes). That is possible only because a
+  handle names an arena location and never a table slot — no handle is
+  invalidated by a grow. The old table arrays are retired rather than freed
+  (a lock-free probe may still be reading them) and released when the pool is
+  destroyed, so a pool that has grown holds up to twice its table in retired
+  arrays. Evicted slots are reused rather than reclaimed in place.
 - Every interned string carries an 8-byte arena prefix in front of its bytes:
   the length, the generation, and the table slot that holds it (the handle
   names the location, so the table needs the back-pointer for eviction).

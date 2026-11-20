@@ -219,6 +219,49 @@ static void test_tombstone_reuse(void) {
 #endif
 }
 
+/* The table can grow: a handle names an arena LOCATION, not a slot, so the
+ * entries may be re-placed anywhere. Growing re-hashes every live entry and
+ * re-places it; the strings and the handles must survive that untouched. */
+static void test_table_grows(void) {
+    enum { N = 5000 };
+    static char buf[N][24];
+    static SF_Handle h[N];
+
+    HYBRID_SCOPED(hp, 16, 64, 64);          /* M = 128 slots to start */
+    uint32_t m0 = hp->short_pool->M;
+
+    int all = 1;
+    for (int i = 0; i < N; i++) {
+        snprintf(buf[i], sizeof buf[i], "grow-%d", i);
+        h[i] = hybrid_intern(hp, buf[i], (uint32_t)strlen(buf[i]));
+        if (h[i].u == 0) { all = 0; break; }
+    }
+    CHECK("grow_all_interned", all);
+    CHECK("grow_table_doubled", hp->short_pool->M > m0);
+
+    int ok = 1;
+    for (int i = 0; i < N; i++) {
+        uint32_t len = 0;
+        const char *s = hybrid_str(hp, h[i], &len);
+        if (!s || len != strlen(buf[i]) || memcmp(s, buf[i], len) != 0) { ok = 0; break; }
+    }
+    CHECK("grow_handles_still_resolve", ok);
+
+    int dedup = 1;
+    for (int i = 0; i < N; i += 97) {
+        SF_Handle again = hybrid_intern(hp, buf[i], (uint32_t)strlen(buf[i]));
+        if (again.u != h[i].u) { dedup = 0; break; }
+    }
+    CHECK("grow_dedup_intact", dedup);
+
+    /* An eviction after a grow must remove the RIGHT entry: the slot
+     * back-pointer in the arena prefix was re-pointed by the grow. */
+    hybrid_evict(hp, h[10]);
+    CHECK("grow_evict_invalidates", hybrid_str(hp, h[10], NULL) == NULL);
+    CHECK("grow_evict_spares_others", hybrid_str(hp, h[11], NULL) != NULL);
+    CHECK("grow_evict_spares_neighbours", hybrid_str(hp, h[9], NULL) != NULL);
+}
+
 int main(void) {
     printf("Hybrid intern lifecycle regressions\n");
     test_evict_intern_churn();
@@ -226,6 +269,7 @@ int main(void) {
     test_scratch_epoch_churn();
     test_stale_handles_null();
     test_tombstone_reuse();
+    test_table_grows();
 
     printf("Results: %d passed, %d failed\n", passed, failed);
     return failed ? 1 : 0;

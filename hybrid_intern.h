@@ -358,6 +358,15 @@ typedef struct {
     _Atomic uint32_t  seq;
     uint32_t          max_entries;
     uint32_t          epoch[2];       /* per tier: [0] = T0, [1] = T1 */
+    /* The table can grow: no handle points into it (a handle names an
+     * arena location), so the entries can be re-placed anywhere. The old
+     * arrays are RETIRED, not freed — a lock-free probe may still be reading
+     * them — and a version counter tells a probe whose table was replaced
+     * under it, so it retries. */
+    _Atomic uint32_t  table_ver;
+    uint8_t          *retired_ctrl[32];
+    IpSlot           *retired_slots[32];
+    uint32_t          n_retired;
     pthread_mutex_t   lock;
 } Pool;
 
@@ -464,6 +473,7 @@ static Pool *pool_create(uint16_t pool_id, uint32_t expected, uint64_t seed) {
     p->M = M;
     p->pool_id = pool_id;
     p->seed = seed;
+    p->table_ver = 1;
     p->max_entries = (uint32_t)(M * LONG_LOAD_NUM / LONG_LOAD_DEN);
     pthread_mutex_init(&p->lock, NULL);
     memset(p->ctrl, 0, ctrl_bytes);
@@ -480,6 +490,10 @@ static void pool_destroy(Pool *p) {
     if (!p) return;
     _arena_free(&p->t0);
     _arena_free(&p->t1);
+    for (uint32_t i = 0; i < p->n_retired; i++) {
+        free(p->retired_ctrl[i]);
+        free(p->retired_slots[i]);
+    }
     free(p->ctrl); free(p->slots); free(p);
 }
 
@@ -495,59 +509,150 @@ static inline uint64_t _tier_bits(uint8_t tier) { return tier == TIER_T1 ? IR_TI
 static void _pool_probe(Pool *p, uint64_t h, uint32_t len,
                         const char *s, uint8_t tier,
                         uint32_t *match_slot, uint32_t *insert_slot) {
-    const uint32_t M = p->M;
-    const uint32_t home = (uint32_t)h & (M - 1);
-    uint8_t  tag = IP_HASH_TAG(h);
-    if (!tag) tag = 1;                       /* 0 means "never used" */
-    const uint16_t fp = IP_HASH_FP(h);
+    /* The table can be replaced under a lock-free probe (a grow). The
+     * version counter tells us, and we simply scan again — the table is
+     * only a lookup accelerator now, so a stale scan is never wrong, just
+     * incomplete. */
+    for (int attempt = 0; attempt < 4; attempt++) {
+        uint32_t v0 = atomic_load_explicit(&p->table_ver, memory_order_acquire);
+        const uint8_t *ctrl = p->ctrl;
+        const IpSlot *slots = p->slots;
+        const uint32_t M = p->M;
 
-    const uint32_t gmask = IP_GROUP - 1;
-    uint32_t group = home & ~gmask;
-    const uint32_t groups = M / IP_GROUP;
-    uint32_t first_del = UINT32_MAX;
+        const uint32_t home = (uint32_t)h & (M - 1);
+        uint8_t  tag = IP_HASH_TAG(h);
+        if (!tag) tag = 1;                       /* 0 means "never used" */
+        const uint16_t fp = IP_HASH_FP(h);
 
-    *match_slot = UINT32_MAX;
-    *insert_slot = UINT32_MAX;
+        const uint32_t gmask = IP_GROUP - 1;
+        uint32_t group = home & ~gmask;
+        const uint32_t groups = M / IP_GROUP;
+        uint32_t first_del = UINT32_MAX;
 
-    for (uint32_t g = 0; g < groups; g++) {
-        uint32_t mm, dm, em;
-        _ctrl_scan(p->ctrl + group, tag, &mm, &dm, &em);
-        if (g == 0 && (home & gmask)) {
-            /* slots before `home` in the first group belong to other chains */
-            uint32_t before = (1u << (home & gmask)) - 1u;
-            mm &= ~before; dm &= ~before; em &= ~before;
+        *match_slot = UINT32_MAX;
+        *insert_slot = UINT32_MAX;
+
+        for (uint32_t g = 0; g < groups; g++) {
+            uint32_t mm, dm, em;
+            _ctrl_scan(ctrl + group, tag, &mm, &dm, &em);
+            if (g == 0 && (home & gmask)) {
+                /* slots before `home` in the first group belong to other chains */
+                uint32_t before = (1u << (home & gmask)) - 1u;
+                mm &= ~before; dm &= ~before; em &= ~before;
+            }
+            while (mm) {
+                uint32_t i = _ctz32(mm);
+                mm &= mm - 1;
+                uint32_t slot = group + i;
+                uint64_t sl = __atomic_load_n(&slots[slot], __ATOMIC_RELAXED);
+                atomic_fetch_add_explicit(&p->n_collisions, 1, memory_order_relaxed);
+                if (IP_SLOT_FP(sl) != fp) continue;
+                if (IP_SLOT_TIER(sl) != tier) continue;
+                const uint8_t *base = _slot_base(p, sl);
+                uint32_t elen = IP_PREFIX_LEN((const IpPrefix *)base);
+                if (elen != len) continue;
+                if (!_bytes_equal(base + sizeof(IpPrefix), s, len)) continue;
+                *match_slot = slot;
+                goto done;
+            }
+            if (first_del == UINT32_MAX && dm) {
+                uint32_t i = _ctz32(dm);
+                first_del = group + i;
+            }
+            if (em) {
+                /* The chain ends in this group. Insert at the first tombstone we
+                 * passed (a tombstone is a usable slot), else at the first empty
+                 * slot. */
+                uint32_t i = _ctz32(em);
+                *insert_slot = (first_del != UINT32_MAX) ? first_del : (group + i);
+                goto done;
+            }
+            group = (group + IP_GROUP) & (M - 1);
         }
-        while (mm) {
-            uint32_t i = _ctz32(mm);
-            mm &= mm - 1;
-            uint32_t slot = group + i;
-            uint64_t sl = __atomic_load_n(&p->slots[slot], __ATOMIC_RELAXED);
-            atomic_fetch_add_explicit(&p->n_collisions, 1, memory_order_relaxed);
-            if (IP_SLOT_FP(sl) != fp) continue;
-            if (IP_SLOT_TIER(sl) != tier) continue;
-            const uint8_t *base = _slot_base(p, sl);
-            uint32_t elen = IP_PREFIX_LEN((const IpPrefix *)base);
-            if (elen != len) continue;
-            if (!_bytes_equal(base + sizeof(IpPrefix), s, len)) continue;
-            *match_slot = slot;
-            return;
-        }
-        if (first_del == UINT32_MAX && dm) {
-            uint32_t i = _ctz32(dm);
-            first_del = group + i;
-        }
-        if (em) {
-            /* The chain ends in this group. Insert at the first tombstone we
-             * passed (a tombstone is a usable slot), else at the first empty
-             * slot. */
-            uint32_t i = _ctz32(em);
-            *insert_slot = (first_del != UINT32_MAX) ? first_del : (group + i);
-            return;
-        }
-        group = (group + IP_GROUP) & (M - 1);
+        /* The whole table was walked: no empty slot, but maybe a tombstone. */
+        *insert_slot = first_del;
+    done:
+        if (v0 == atomic_load_explicit(&p->table_ver, memory_order_acquire)) return;
+        /* the table was replaced under us — scan again */
     }
-    /* The whole table was walked: no empty slot, but maybe a tombstone. */
-    *insert_slot = first_del;
+}
+
+/* Grow the table: double it and re-place every live entry.
+ *
+ * No handle points into the table — a handle names an arena LOCATION — so
+ * the entries may move freely; the strings themselves never move. Each live
+ * entry is re-hashed from its bytes (the slot keeps only a 15-bit
+ * fingerprint, which is not enough to recompute an index), so a grow costs
+ * one pass over the table plus one hash per entry: amortised O(1) per
+ * insert.
+ *
+ * The old arrays are retired rather than freed: a lock-free probe may still
+ * be reading them. They are released when the pool is destroyed. */
+static bool _pool_grow(Pool *p) {
+    if (p->n_retired >= (uint32_t)(sizeof p->retired_ctrl / sizeof p->retired_ctrl[0]))
+        return false;
+    uint32_t M2 = p->M * 2;
+    if (M2 > (1u << 24)) return false;
+
+    size_t ctrl_bytes = ((size_t)M2 + 63u) & ~(size_t)63u;
+    size_t slot_bytes = ((size_t)M2 * sizeof(IpSlot) + 63u) & ~(size_t)63u;
+    uint8_t *nc = (uint8_t *)aligned_alloc(64, ctrl_bytes);
+    IpSlot *ns = (IpSlot *)aligned_alloc(64, slot_bytes);
+    if (!nc || !ns) { free(nc); free(ns); return false; }
+    memset(nc, 0, ctrl_bytes);
+
+    const uint32_t oldM = p->M;
+    uint8_t *old_ctrl = p->ctrl;
+    IpSlot *old_slots = p->slots;
+
+    for (uint32_t i = 0; i < oldM; i++) {
+        uint8_t ctrl = old_ctrl[i];
+        if (ctrl == IP_CTRL_EMPTY || ctrl == IP_CTRL_DELETED) continue;
+        uint64_t sl = old_slots[i];
+        /* re-hash the string from its bytes */
+        const uint8_t *base = _slot_base(p, sl);
+        uint32_t elen = IP_PREFIX_LEN((const IpPrefix *)base);
+        uint64_t h = plumshash((const char *)(base + sizeof(IpPrefix)), elen, p->seed);
+        uint32_t home = (uint32_t)h & (M2 - 1);
+        uint8_t  tag = IP_HASH_TAG(h);
+        if (!tag) tag = 1;
+        uint16_t fp = IP_HASH_FP(h);
+        /* linear insertion into the empty table */
+        uint32_t slot = home;
+        for (uint32_t k = 0; k < M2; k++) {
+            uint32_t s2 = (home + k) & (M2 - 1);
+            if (nc[s2] == IP_CTRL_EMPTY) { slot = s2; break; }
+        }
+        ns[slot] = IP_SLOT_MAKE(IP_SLOT_OFFSET(sl), IP_SLOT_CHUNK(sl),
+                                 IP_SLOT_TIER(sl), fp);
+        nc[slot] = tag;
+        /* The prefix holds the slot back-pointer, and the entry just moved:
+         * update it, or an eviction would tombstone the wrong slot. */
+        IpPrefix *pfx = (IpPrefix *)base;
+        pfx->hi = slot;
+    }
+
+    p->ctrl = nc;
+    p->slots = ns;
+    p->M = M2;
+    p->max_entries = (uint32_t)(M2 * LONG_LOAD_NUM / LONG_LOAD_DEN);
+    atomic_store_explicit(&p->table_ver,
+                        atomic_load_explicit(&p->table_ver, memory_order_relaxed) + 1u,
+                        memory_order_release);
+
+    /* retire the old arrays (a lock-free probe may still be reading them) */
+    p->retired_ctrl[p->n_retired] = old_ctrl;
+    p->retired_slots[p->n_retired] = old_slots;
+    p->n_retired++;
+    return true;
+}
+
+/* Grow when the table gets too full. Called under the lock. */
+static void _pool_maybe_grow(Pool *p) {
+    uint32_t used = atomic_load_explicit(&p->n_entries, memory_order_relaxed) +
+                    atomic_load_explicit(&p->n_tombs, memory_order_relaxed);
+    if (used + (p->M / 4) < p->M) return;      /* below 75% — no need */
+    _pool_grow(p);
 }
 
 /* Write the slot and publish the ctrl byte. The ctrl byte is published
@@ -647,6 +752,7 @@ static SF_Handle pool_intern(Pool *p, const char *s, uint32_t len, uint8_t tier)
             return SF_NULL;
         }
         SF_Handle out = _pool_publish(p, insert_slot, h, off, cid, tier);
+        _pool_maybe_grow(p);
         _seq_end(&p->seq);
         _unlock(&p->lock);
         return out;
@@ -678,6 +784,7 @@ static SF_Handle pool_intern(Pool *p, const char *s, uint32_t len, uint8_t tier)
             if (len) memcpy(dst, s, len);
             if (padded > len) memset(dst + len, 0, padded - len);
             out = _pool_publish(p, insert_slot, h, off, cid, tier);
+            _pool_maybe_grow(p);
         }
     }
     _seq_end(&p->seq);

@@ -140,16 +140,20 @@ static double bench_intern_hit(uint32_t n, char *strings, uint32_t width,
                                char *extra, size_t extra_cap) {
     double best = 1e30;
     uint64_t ops = 0;
+    volatile uint64_t sink = 0;
     for (int r = 0; r < reps; r++) {
         fill_strings(strings, n, width, 0);
         for (uint32_t i = 0; i < n; i++)
-            hybrid_intern(hp, strings + (size_t)i * width, (uint32_t)strlen(strings + (size_t)i * width));
+            sink += hybrid_intern(hp, strings + (size_t)i * width,
+                                 (uint32_t)strlen(strings + (size_t)i * width)).u;
         double t0 = now_sec();
+        uint64_t hsum = 0;
         for (uint32_t i = 0; i < n; i++) {
             const char *s = strings + (size_t)i * width;
-            hybrid_intern(hp, s, (uint32_t)strlen(s));
+            hsum += hybrid_intern(hp, s, (uint32_t)strlen(s)).u;
         }
         double dt = now_sec() - t0;
+        sink += hsum;   /* keep the work alive */
         if (dt < best) best = dt;
         ops = n;
     }
@@ -239,6 +243,51 @@ static void bench_long_string(uint32_t size, uint32_t count) {
     free(buf);
 }
 
+/* The scratch (T0) tier: intern into it, then drop the whole tier in bulk
+ * at the epoch boundary. This is the tier a compiler uses for per-statement
+ * or per-pass temporaries, so the boundary cost matters. */
+static void bench_scratch(uint32_t per_epoch, uint32_t epochs) {
+    char *strings = malloc((size_t)per_epoch * STR_BYTES);
+    if (!strings) return;
+
+    double best_intern = 1e30, best_epoch = 1e30;
+    uint64_t ops = 0, cleared = 0;
+    uint32_t slots = 0;
+    volatile uint64_t sink = 0;
+    for (int r = 0; r < reps; r++) {
+        for (uint32_t e = 0; e < epochs; e++) {
+            fill_strings(strings, per_epoch, STR_BYTES, r * 1000 + (int)e);
+            HYBRID_SCOPED(hp, 34, per_epoch, per_epoch);
+            double t0 = now_sec();
+            uint64_t hsum = 0;
+            for (uint32_t i = 0; i < per_epoch; i++)
+                hsum += hybrid_intern_scratch(hp, strings + (size_t)i * STR_BYTES,
+                                              STR_BYTES - 1).u;
+            double dt_intern = now_sec() - t0;
+            sink += hsum;   /* keep the work alive */
+            ops += per_epoch;
+
+            double t1 = now_sec();
+            uint32_t c = hybrid_epoch_end(hp);
+            double dt_epoch = now_sec() - t1;
+            cleared += c;
+            slots = hp->short_pool->M;
+
+            if (dt_intern < best_intern) best_intern = dt_intern;
+            if (dt_epoch < best_epoch) best_epoch = dt_epoch;
+        }
+    }
+    free(strings);
+
+    char extra[128];
+    snprintf(extra, sizeof extra, "per_epoch=%u slots=%u", per_epoch, slots);
+    report("st", "scratch_intern", best_intern, ops, extra);
+    (void)sink;
+    snprintf(extra, sizeof extra, "per_epoch=%u slots=%u cleared=%llu",
+             per_epoch, slots, (unsigned long long)cleared);
+    report("st", "epoch_end", best_epoch, 1, extra);
+}
+
 static void run_single_threaded(uint32_t sweep_max) {
     printf("## single-threaded (per-operation latency, one caller)\n");
     uint32_t sizes[3] = { 10000, 100000, 1000000 };
@@ -271,6 +320,7 @@ static void run_single_threaded(uint32_t sweep_max) {
 
     bench_long_string(1024, 200);
     bench_long_string(65536, 50);
+    bench_scratch(10000, 4);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
