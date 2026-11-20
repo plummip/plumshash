@@ -376,10 +376,14 @@ typedef struct {
     uint32_t          M;
     uint16_t          pool_id;
     uint64_t          seed;
-    _Atomic uint32_t  n_entries;
-    _Atomic uint32_t  n_tombs;
-    _Atomic uint32_t  n_inserts;   /* bumped on every publish (under the lock) */
-    _Atomic uint32_t  n_collisions;
+    /* Plain counters, not atomics: every mutation happens under the pool
+     * lock, and a statistic that is read a moment stale is harmless. On
+     * AArch64 an atomic read-modify-write is a locked instruction — four
+     * of them per insert cost more than the lock they were counting. */
+    uint32_t          n_entries;
+    uint32_t          n_tombs;
+    uint32_t          n_inserts;   /* bumped on every publish (under the lock) */
+    _Atomic uint32_t  n_collisions; /* counted in the LOCK-FREE probe */
     _Atomic uint32_t  seq;
     uint32_t          max_entries;
     uint32_t          epoch[2];       /* per tier: [0] = T0, [1] = T1 */
@@ -443,41 +447,37 @@ static inline uint32_t _neon_mask16(uint8x16_t m) {
 }
 #endif
 
-/* Scan one group of ctrl bytes: which slots carry our tag, which are
- * deleted, which are still empty. One vector load, three compares. */
+/* Scan one group of ctrl bytes: which slots carry our tag, and which are
+ * still empty. The DELETED class is scanned separately (see below): the
+ * insert path wants it, the lookup path does not, and on AArch64 every
+ * bitmask costs a gather — a shift-and-multiply chain with a long
+ * dependency — so the hot path pays for two, not three. */
 static inline void _ctrl_scan(const uint8_t *c, uint8_t tag,
-                              uint32_t *match, uint32_t *deleted,
-                              uint32_t *empty) {
+                              uint32_t *match, uint32_t *empty) {
 #if defined(__AVX2__)
     __m256i v  = _mm256_loadu_si256((const __m256i *)c);
     __m256i tv = _mm256_set1_epi8((char)tag);
-    __m256i dv = _mm256_set1_epi8((char)IP_CTRL_DELETED);
     __m256i ev = _mm256_setzero_si256();
-    *match   = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, tv));
-    *deleted = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, dv));
-    *empty   = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, ev));
+    *match = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, tv));
+    *empty = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, ev));
 #elif defined(__SSE2__)
     __m128i v  = _mm_loadu_si128((const __m128i *)c);
     __m128i tv = _mm_set1_epi8((char)tag);
-    __m128i dv = _mm_set1_epi8((char)IP_CTRL_DELETED);
     __m128i ev = _mm_setzero_si128();
-    *match   = (uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(v, tv));
-    *deleted = (uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(v, dv));
-    *empty   = (uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(v, ev));
+    *match = (uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(v, tv));
+    *empty = (uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(v, ev));
 #elif defined(__ARM_NEON) || defined(__aarch64__)
-    uint8x16_t v  = vld1q_u8(c);
-    *match   = _neon_mask16(vceqq_u8(v, vdupq_n_u8(tag)));
-    *deleted = _neon_mask16(vceqq_u8(v, vdupq_n_u8((uint8_t)IP_CTRL_DELETED)));
-    *empty   = _neon_mask16(vceqq_u8(v, vdupq_n_u8(0)));
+    uint8x16_t v = vld1q_u8(c);
+    *match = _neon_mask16(vceqq_u8(v, vdupq_n_u8(tag)));
+    *empty = _neon_mask16(vceqq_u8(v, vdupq_n_u8(0)));
 #else
-    uint32_t m = 0, d = 0, e = 0;
+    uint32_t m = 0, e = 0;
     for (uint32_t i = 0; i < IP_GROUP; i++) {
         uint32_t bit = 1u << i;
-        if (c[i] == tag)                 m |= bit;
-        else if (c[i] == IP_CTRL_DELETED) d |= bit;
-        else if (c[i] == IP_CTRL_EMPTY)   e |= bit;
+        if (c[i] == tag)               m |= bit;
+        else if (c[i] == IP_CTRL_EMPTY) e |= bit;
     }
-    *match = m; *deleted = d; *empty = e;
+    *match = m; *empty = e;
 #endif
 }
 
@@ -525,6 +525,47 @@ static void pool_destroy(Pool *p) {
 /* The tier a handle carries for a given entry tier. */
 static inline uint64_t _tier_bits(uint8_t tier) { return tier == TIER_T1 ? IR_TIER_T1 : IR_TIER_T0; }
 
+/* The deleted (tombstone) class, scanned only when the insert path wants
+ * the first reusable slot. The cheap question comes first: is there one in
+ * this group at all? */
+static inline bool _ctrl_any_deleted(const uint8_t *c) {
+#if defined(__AVX2__)
+    __m256i v = _mm256_loadu_si256((const __m256i *)c);
+    return _mm256_movemask_epi8(_mm256_cmpeq_epi8(v,
+        _mm256_set1_epi8((char)IP_CTRL_DELETED))) != 0;
+#elif defined(__SSE2__)
+    __m128i v = _mm_loadu_si128((const __m128i *)c);
+    return _mm_movemask_epi8(_mm_cmpeq_epi8(v,
+        _mm_set1_epi8((char)IP_CTRL_DELETED))) != 0;
+#elif defined(__ARM_NEON) || defined(__aarch64__)
+    uint8x16_t v = vld1q_u8(c);
+    return vmaxvq_u8(vceqq_u8(v, vdupq_n_u8((uint8_t)IP_CTRL_DELETED))) != 0;
+#else
+    for (uint32_t i = 0; i < IP_GROUP; i++) if (c[i] == IP_CTRL_DELETED) return true;
+    return false;
+#endif
+}
+
+static inline uint32_t _ctrl_deleted_mask(const uint8_t *c) {
+#if defined(__AVX2__)
+    __m256i v = _mm256_loadu_si256((const __m256i *)c);
+    return (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v,
+        _mm256_set1_epi8((char)IP_CTRL_DELETED)));
+#elif defined(__SSE2__)
+    __m128i v = _mm_loadu_si128((const __m128i *)c);
+    return (uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(v,
+        _mm_set1_epi8((char)IP_CTRL_DELETED)));
+#elif defined(__ARM_NEON) || defined(__aarch64__)
+    uint8x16_t v = vld1q_u8(c);
+    return _neon_mask16(vceqq_u8(v, vdupq_n_u8((uint8_t)IP_CTRL_DELETED)));
+#else
+    uint32_t d = 0;
+    for (uint32_t i = 0; i < IP_GROUP; i++)
+        if (c[i] == IP_CTRL_DELETED) d |= 1u << i;
+    return d;
+#endif
+}
+
 /* Walk the probe chain for (h, len, s).
  *
  * Sets match_slot (and match_gen) when an existing entry is found, else
@@ -558,12 +599,12 @@ static void _pool_probe(Pool *p, uint64_t h, uint32_t len,
         *insert_slot = UINT32_MAX;
 
         for (uint32_t g = 0; g < groups; g++) {
-            uint32_t mm, dm, em;
-            _ctrl_scan(ctrl + group, tag, &mm, &dm, &em);
+            uint32_t mm, em;
+            _ctrl_scan(ctrl + group, tag, &mm, &em);
             if (g == 0 && (home & gmask)) {
                 /* slots before `home` in the first group belong to other chains */
                 uint32_t before = (1u << (home & gmask)) - 1u;
-                mm &= ~before; dm &= ~before; em &= ~before;
+                mm &= ~before; em &= ~before;
             }
             while (mm) {
                 uint32_t i = _ctz32(mm);
@@ -580,9 +621,11 @@ static void _pool_probe(Pool *p, uint64_t h, uint32_t len,
                 *match_slot = slot;
                 goto done;
             }
-            if (first_del == UINT32_MAX && dm) {
-                uint32_t i = _ctz32(dm);
-                first_del = group + i;
+            if (first_del == UINT32_MAX && _ctrl_any_deleted(ctrl + group)) {
+                uint32_t dm = _ctrl_deleted_mask(ctrl + group);
+                if (g == 0 && (home & gmask))
+                    dm &= ~((1u << (home & gmask)) - 1u);
+                if (dm) first_del = group + _ctz32(dm);
             }
             if (em) {
                 /* The chain ends in this group. Insert at the first tombstone we
@@ -664,7 +707,7 @@ static bool _pool_rebuild(Pool *p, uint32_t M2) {
                         atomic_load_explicit(&p->table_ver, memory_order_relaxed) + 1u,
                         memory_order_release);
     /* the rebuilt table holds only live entries: no tombstones */
-    atomic_store_explicit(&p->n_tombs, 0, memory_order_relaxed);
+    p->n_tombs = 0;
 
     /* retire the old arrays (a lock-free probe may still be reading them) */
     p->retired_ctrl[p->n_retired] = old_ctrl;
@@ -686,8 +729,8 @@ static bool _pool_rebuild(Pool *p, uint32_t M2) {
  * Both are one pass over the table plus one hash per live entry, so both
  * are amortised O(1) per insert. */
 static void _pool_maybe_resize(Pool *p) {
-    uint32_t entries = atomic_load_explicit(&p->n_entries, memory_order_relaxed);
-    uint32_t tombs = atomic_load_explicit(&p->n_tombs, memory_order_relaxed);
+    uint32_t entries = p->n_entries;
+    uint32_t tombs = p->n_tombs;
     if (entries + (p->M / 4) >= p->M) {
         /* 75% of the LIVE entries -> grow. Tombstones do not count: a
          * deleted slot is a reusable slot, not a full one. */
@@ -718,10 +761,10 @@ static SF_Handle _pool_publish(Pool *p, uint32_t slot, uint64_t h,
     if (!tag) tag = 1;
     uint8_t old_ctrl = __atomic_load_n(&p->ctrl[slot], __ATOMIC_RELAXED);
     __atomic_store_n(&p->ctrl[slot], tag, __ATOMIC_RELEASE);
-    atomic_fetch_add_explicit(&p->n_entries, 1, memory_order_relaxed);
-    atomic_fetch_add_explicit(&p->n_inserts, 1, memory_order_relaxed);
+    p->n_entries++;
+    p->n_inserts++;
     if (old_ctrl == IP_CTRL_DELETED)
-        atomic_fetch_sub_explicit(&p->n_tombs, 1, memory_order_relaxed);
+        p->n_tombs--;
 
     uint16_t chunk = (uint16_t)((tier == TIER_T1 ? IR_CHUNK_TIER : 0u) |
                                  (cid & IR_CHUNK_INDEX));
@@ -744,7 +787,7 @@ static SF_Handle pool_intern(Pool *p, const char *s, uint32_t len, uint8_t tier)
          * interned never touches the lock at all. That is the common case
          * in real use (dedup), and it is where the shared-pool contention
          * used to hurt. */
-        uint32_t ins0 = atomic_load_explicit(&p->n_inserts, memory_order_relaxed);
+        uint32_t ins0 = p->n_inserts;
         _pool_probe(p, h, len, s, tier, &match_slot, &insert_slot);
         if (match_slot != UINT32_MAX) {
             uint64_t sl = __atomic_load_n(&p->slots[match_slot], __ATOMIC_RELAXED);
@@ -778,17 +821,15 @@ static SF_Handle pool_intern(Pool *p, const char *s, uint32_t len, uint8_t tier)
          * a re-probe (to catch a concurrent insert of the same string) plus
          * the slot write. */
         _lock(&p->lock);
-        _seq_begin(&p->seq);
         /* Only re-probe if another thread inserted something since our
          * lock-free probe: under the lock no insert can be in flight, so an
          * unchanged counter means our slot is still ours and the string was
          * not interned meanwhile. That turns the common case into one
          * probe instead of two. */
-        uint32_t ins1 = atomic_load_explicit(&p->n_inserts, memory_order_relaxed);
+        uint32_t ins1 = p->n_inserts;
         if (ins1 != ins0) {
             _pool_probe(p, h, len, s, tier, &match_slot, &insert_slot);
             if (match_slot == UINT32_MAX && insert_slot == UINT32_MAX) {
-                _seq_end(&p->seq);
                 _unlock(&p->lock);
                 return SF_NULL;
             }
@@ -807,13 +848,11 @@ static SF_Handle pool_intern(Pool *p, const char *s, uint32_t len, uint8_t tier)
             return dup;
         }
         if (insert_slot == UINT32_MAX) {
-            _seq_end(&p->seq);
             _unlock(&p->lock);
             return SF_NULL;
         }
         SF_Handle out = _pool_publish(p, insert_slot, h, off, cid, tier);
         _pool_maybe_resize(p);
-        _seq_end(&p->seq);
         _unlock(&p->lock);
         return out;
     }
@@ -875,8 +914,8 @@ static void pool_evict(Pool *p, SF_Handle h) {
             uint8_t ctrl = __atomic_load_n(&p->ctrl[slot], __ATOMIC_ACQUIRE);
             if (ctrl != IP_CTRL_EMPTY && ctrl != IP_CTRL_DELETED) {
                 __atomic_store_n(&p->ctrl[slot], IP_CTRL_DELETED, __ATOMIC_RELEASE);
-                atomic_fetch_sub_explicit(&p->n_entries, 1, memory_order_relaxed);
-                atomic_fetch_add_explicit(&p->n_tombs, 1, memory_order_relaxed);
+                p->n_entries--;
+                p->n_tombs++;
             }
         }
     }
@@ -920,8 +959,8 @@ static uint32_t pool_epoch_end(Pool *p) {
         uint64_t sl = __atomic_load_n(&p->slots[i], __ATOMIC_RELAXED);
         if (IP_SLOT_TIER(sl) != TIER_T0) continue;
         __atomic_store_n(&p->ctrl[i], IP_CTRL_DELETED, __ATOMIC_RELEASE);
-        atomic_fetch_sub_explicit(&p->n_entries, 1, memory_order_relaxed);
-        atomic_fetch_add_explicit(&p->n_tombs, 1, memory_order_relaxed);
+        p->n_entries--;
+        p->n_tombs++;
         cleared++;
     }
     _arena_free(&p->t0);
@@ -1009,13 +1048,13 @@ typedef struct {
 
 static HybridStats hybrid_stats(HybridPool *hp) {
     HybridStats s = {0};
-    s.short_entries = atomic_load_explicit(&hp->short_pool->n_entries, memory_order_relaxed);
+    s.short_entries = hp->short_pool->n_entries;
     s.short_max = hp->short_pool->M;
     s.short_collisions = atomic_load_explicit(&hp->short_pool->n_collisions, memory_order_relaxed);
-    s.short_tombs = atomic_load_explicit(&hp->short_pool->n_tombs, memory_order_relaxed);
-    s.long_entries = atomic_load_explicit(&hp->long_pool->n_entries, memory_order_relaxed);
+    s.short_tombs = hp->short_pool->n_tombs;
+    s.long_entries = hp->long_pool->n_entries;
     s.long_max = hp->long_pool->M;
-    s.long_tombs = atomic_load_explicit(&hp->long_pool->n_tombs, memory_order_relaxed);
+    s.long_tombs = hp->long_pool->n_tombs;
     s.long_collisions = atomic_load_explicit(&hp->long_pool->n_collisions, memory_order_relaxed);
     s.short_load = (double)s.short_entries / s.short_max;
     s.long_load = (double)s.long_entries / s.long_max;

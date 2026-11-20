@@ -21,6 +21,7 @@ test_hybrid_lifecycle
 bench_compete
 test_speed
 bench_hybrid
+bench_swiss
 bench_plums
 
 # ── Tooling ──────────────────────────────────────────────────────────────
