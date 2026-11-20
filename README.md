@@ -199,6 +199,15 @@ tombstoned slots keep the probe chain intact (dedup survives an eviction),
 the next insert reuses the deleted slot, evict/intern churn never exhausts
 the table, and stale handles resolve `NULL`. See [Testing](#testing).
 
+Bench: `bench_hybrid` (`make bench`) measures the pool itself, not the hash.
+The single-threaded and the multi-threaded sections are kept apart on purpose —
+the first is per-operation latency for one caller (insert path, dedup path,
+lock-free read path), the second is aggregate throughput for T callers sharing
+one pool (the pool mutex's cost). A mutex change barely shows up in a
+single-threaded run, and cache-locality work is invisible in a contended one.
+`./bench_hybrid st` and `./bench_hybrid mt` run one section at a time; each
+case prints one machine-readable `bench section=… case=… ns=… ops_s=…` line.
+
 ## Benchmarks vs the field
 
 Methodology (`bench_compete.c`): two harnesses, order-randomized (size,

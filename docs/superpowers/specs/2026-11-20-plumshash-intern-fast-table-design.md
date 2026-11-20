@@ -151,6 +151,11 @@ kind byte:  LK_FREE  (0)    EMPTY    — probe stops here
 - Probe continues past `LK_TOMB` slots; it stops only at `LK_FREE`.
 - Insert reuses the **first** `LK_TOMB` slot found on the chain (so tombstones
   do not accumulate faster than necessary); otherwise the first `LK_FREE`.
+- A tombstone is a usable slot **even when the chain holds no free slot**: the
+  probe walks the whole chain, finds no duplicate, and then claims the first
+  deleted slot. Without this the pool reports "full" while a perfectly good
+  slot sits deleted on the chain — the failure is seed-dependent, so it shows
+  up intermittently, not on every run.
 - **No rehash in this phase.** A rehash re-inserts live entries at new
   positions, and the handle encodes the slot index — so rehashing would
   invalidate every live handle. Reclaiming the table therefore waits for
@@ -186,9 +191,20 @@ New `bench_hybrid.c`, wired into `make bench` (not `make test`). It reports:
   throughput, plus the same test with one shared pool (the mutex's cost).
 - **table size sweep**: 10^4 → 10^6 entries, so the cache cliff is visible.
 
-Each case prints a stable machine-readable line so before/after numbers can be
-diffed in a commit message. The baseline is captured on the current code
-before phase 2 starts.
+**The single-threaded and the multi-threaded measurements stay in separate
+sections and are never mixed into one figure.** They answer different
+questions — per-operation latency for one caller, aggregate throughput for T
+callers — and each hides the other's regressions: a mutex change barely shows
+up in a single-threaded run, and cache-locality work is invisible in a
+contended one. `./bench_hybrid st` and `./bench_hybrid mt` run one section at
+a time; every case prints one stable machine-readable line:
+
+```
+bench section=st case=intern_miss n=100000 ns=... ops_s=... entries=... slots=... collisions=...
+bench section=mt case=threads_intern threads=4 ns=... ops_s=... entries=...
+```
+
+The baseline is captured on the current code before phase 2 starts.
 
 ### 4.3 Phase 2 — table redesign
 
@@ -291,6 +307,20 @@ the CAS on the ctrl byte plus the post-CAS duplicate check must guarantee that
 exactly one entry exists per string. This is the phase's main risk and gets its
 own stress test (N threads × the same M strings, assert one entry each).
 
+**The single-threaded and the concurrent insert paths stay separate.** A pool
+is created in one mode or the other, so a pool used by one thread never pays
+for the CAS machinery (the compare-and-swap, the reservation state, the
+duplicate re-check), and a shared pool never pays for a mutex it does not
+need. The mode is a creation-time flag, not a runtime switch, so the cost is
+decided once, at `hybrid_create()` time:
+
+```c
+HybridPool *hp = hybrid_create(1, 4096, 1024);            /* single-threaded */
+HybridPool *hp = hybrid_create_concurrent(1, 4096, 1024); /* shared pool    */
+```
+
+The benchmark measures them in separate sections (§4.2) for the same reason.
+
 ---
 
 ## 5. Data formats
@@ -317,12 +347,14 @@ own stress test (N threads × the same M strings, assert one entry each).
   rebuild.
 - The existing `test_hybrid_security.c` keeps covering handle forgery.
 
-**Performance** (in `make bench`, reported in the commit message)
+**Performance** (in `make bench`, reported in the commit message; the
+single-threaded and multi-threaded sections are read separately)
 
-- lookup: ≥ 2× lower ns/lookup at 10^6 entries (the miss-dominated regime).
-- intern (miss-heavy, single thread): ≥ 1.5× lower ns/intern.
-- intern (multi-threaded, one pool): ≥ 3× aggregate throughput at 4 threads
-  versus the mutex baseline.
+- single-threaded `lookup`: ≥ 2× lower ns/lookup at 10^6 entries (the
+  miss-dominated regime).
+- single-threaded `intern_miss`: ≥ 1.5× lower ns/intern.
+- multi-threaded `threads_intern`: ≥ 3× aggregate throughput at 4 threads
+  versus the mutex baseline, measured in the `mt` section only.
 - memory: table bytes per slot must fall from 32 B to ≤ 9 B; the arena
   overhead from the prefix must stay ≤ 32 B/string.
 

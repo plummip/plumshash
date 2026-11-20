@@ -342,7 +342,8 @@ static void pool_destroy(Pool *p) {
     free(p->headers); free(p);
 }
 
-static inline uint64_t _entry_tier_bits(const Entry *eh) { return eh->tier == TIER_T1 ? IR_TIER_T1 : IR_TIER_T0; }
+/* The tier a handle carries for a given entry tier. */
+static inline uint64_t _tier_bits(uint8_t tier) { return tier == TIER_T1 ? IR_TIER_T1 : IR_TIER_T0; }
 
 static SF_Handle pool_intern(Pool *p, const char *s, uint32_t len, uint8_t tier) {
     if (len > HYBRID_INTERN_MAX_LEN || (len != 0 && s == NULL)) return SF_NULL;
@@ -355,6 +356,11 @@ static SF_Handle pool_intern(Pool *p, const char *s, uint32_t len, uint8_t tier)
     _seq_begin(&p->seq);
     SF_Handle out = SF_NULL;
     uint32_t first_tomb = UINT32_MAX;   /* earliest deleted slot on this chain */
+    uint32_t insert_slot = UINT32_MAX;  /* where a new entry would go */
+    uint32_t match_slot = UINT32_MAX;   /* an existing entry was found */
+    uint8_t  match_gen = 0;
+    int      insert_is_tomb = 0;
+
     for (uint32_t probe = 0; probe < p->M; probe++) {
         uint32_t p2 = (pos + probe) & (p->M - 1);
         Entry *eh = &p->headers[p2];
@@ -371,12 +377,46 @@ static SF_Handle pool_intern(Pool *p, const char *s, uint32_t len, uint8_t tier)
 
         if (kind == LK_FREE) {
             /* Claim the earliest tombstone we passed, else this free slot. */
-            uint32_t slot = (first_tomb != UINT32_MAX) ? first_tomb : p2;
-            Entry *target = &p->headers[slot];
-            uint64_t thdr = __atomic_load_n((uint64_t *)target, __ATOMIC_RELAXED);
+            if (first_tomb != UINT32_MAX) {
+                insert_slot = first_tomb;
+                insert_is_tomb = 1;
+            } else {
+                insert_slot = p2;
+            }
+            break;
+        }
 
-            uint8_t cid; uint32_t off;
-            if (!_arena_alloc(a, len, &cid, &off)) break;
+        /* LK_OWNED */
+        uint32_t hg = (uint32_t)hdr;
+        uint64_t hdr1 = __atomic_load_n((uint64_t *)eh + 1, __ATOMIC_RELAXED);
+        uint32_t elen = (uint32_t)hdr1;
+        uint8_t etier = (uint8_t)(hdr >> 48);
+        if (etier == tier && ((hg ^ ((uint32_t)h32 << 8)) < 0x100u) && elen == len
+            && _entry_matches(p, eh, s, len)) {
+            match_slot = p2; match_gen = (uint8_t)hg;
+            break;
+        }
+        atomic_fetch_add_explicit(&p->n_collisions, 1, memory_order_relaxed);
+    }
+
+    /* The chain held no free slot, but it did hold a deleted one. A
+     * tombstone IS a usable slot: without this the pool reports "full"
+     * while a perfectly good slot sits deleted on the chain. The whole
+     * chain was walked, so no duplicate was missed either. */
+    if (match_slot == UINT32_MAX && insert_slot == UINT32_MAX &&
+        first_tomb != UINT32_MAX) {
+        insert_slot = first_tomb;
+        insert_is_tomb = 1;
+    }
+
+    if (match_slot != UINT32_MAX) {
+        out = _encode_handle(match_slot, match_gen, p->pool_id, _tier_bits(tier));
+    } else if (insert_slot != UINT32_MAX) {
+        Entry *target = &p->headers[insert_slot];
+        uint64_t thdr = __atomic_load_n((uint64_t *)target, __ATOMIC_RELAXED);
+
+        uint8_t cid; uint32_t off;
+        if (_arena_alloc(a, len, &cid, &off)) {
             uint8_t *dst = a->chunks[cid]->data + off;
             if (len) memcpy(dst, s, len);
             uint32_t padded = (len + 31) & ~31;
@@ -395,23 +435,10 @@ static SF_Handle pool_intern(Pool *p, const char *s, uint32_t len, uint8_t tier)
             ne.tier = tier;
             _store_header(target, &ne);
             atomic_fetch_add_explicit(&p->n_entries, 1, memory_order_relaxed);
-            if (slot != p2)
+            if (insert_is_tomb)
                 atomic_fetch_sub_explicit(&p->n_tombs, 1, memory_order_relaxed);
-            out = _encode_handle(slot, gen, p->pool_id, tier == TIER_T1 ? IR_TIER_T1 : IR_TIER_T0);
-            break;
+            out = _encode_handle(insert_slot, gen, p->pool_id, _tier_bits(tier));
         }
-
-        /* LK_OWNED */
-        uint32_t hg = (uint32_t)hdr;
-        uint64_t hdr1 = __atomic_load_n((uint64_t *)eh + 1, __ATOMIC_RELAXED);
-        uint32_t elen = (uint32_t)hdr1;
-        uint8_t etier = (uint8_t)(hdr >> 48);
-        if (etier == tier && ((hg ^ ((uint32_t)h32 << 8)) < 0x100u) && elen == len
-            && _entry_matches(p, eh, s, len)) {
-            out = _encode_handle(p2, (uint8_t)hg, p->pool_id, _entry_tier_bits(eh));
-            break;
-        }
-        atomic_fetch_add_explicit(&p->n_collisions, 1, memory_order_relaxed);
     }
     _seq_end(&p->seq);
     _unlock(&p->lock);
@@ -575,7 +602,8 @@ static uint32_t hybrid_epoch_end(HybridPool *hp) {
 typedef struct {
     uint32_t short_entries, short_max;
     uint32_t long_entries, long_max, long_collisions;
-    uint32_t short_tombs, long_tombs;   /* deleted slots awaiting reuse */
+    uint32_t short_collisions;        /* probe-chain collisions, short tier */
+    uint32_t short_tombs, long_tombs; /* deleted slots awaiting reuse */
     double   short_load, long_load;
 } HybridStats;
 
@@ -583,6 +611,7 @@ static HybridStats hybrid_stats(HybridPool *hp) {
     HybridStats s = {0};
     s.short_entries = atomic_load_explicit(&hp->short_pool->n_entries, memory_order_relaxed);
     s.short_max = hp->short_pool->M;
+    s.short_collisions = atomic_load_explicit(&hp->short_pool->n_collisions, memory_order_relaxed);
     s.short_tombs = atomic_load_explicit(&hp->short_pool->n_tombs, memory_order_relaxed);
     s.long_entries = atomic_load_explicit(&hp->long_pool->n_entries, memory_order_relaxed);
     s.long_max = hp->long_pool->M;
@@ -597,10 +626,10 @@ static void hybrid_print_stats(HybridPool *hp) {
     HybridStats s = hybrid_stats(hp);
     fprintf(stderr,
         "[HybridPool id=%u]\n"
-        "  Short pool: %u / %u slots (%.1f%%), tombstones=%u\n"
+        "  Short pool: %u / %u slots (%.1f%%), tombstones=%u, collisions=%u\n"
         "  Long pool : %u / %u slots (%.1f%%), tombstones=%u, collisions=%u\n",
         hp->base_pool_id,
-        s.short_entries, s.short_max, s.short_load * 100.0, s.short_tombs,
+        s.short_entries, s.short_max, s.short_load * 100.0, s.short_tombs, s.short_collisions,
         s.long_entries, s.long_max, s.long_load * 100.0, s.long_tombs,
         s.long_collisions);
 }

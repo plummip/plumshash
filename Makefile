@@ -13,7 +13,7 @@ REF      := -Irefs -Irefs/t1ha -I.
 TESTS    := test_sanitize test_quality test_comb16 test_security test_headers \
             smhasher_plums test_edge test_extensive test_hybrid test_hybrid_security \
             test_hybrid_lifecycle
-BENCHES  := bench_compete test_speed
+BENCHES  := bench_compete test_speed bench_hybrid
 BINS     := $(TESTS) $(BENCHES)
 
 .PHONY: all test bench clean
@@ -66,6 +66,12 @@ bench_compete: bench_compete.c plumshash.h refs/rapidhash.h refs/wyhash.h refs/x
 test_speed: test_speed.c plumshash.h
 	$(CC) $(CFLAGS) $(REF) -o $@ test_speed.c
 
+# Intern-pool bench. The single-threaded (latency) and multi-threaded
+# (throughput) sections are kept apart on purpose; `./bench_hybrid st` and
+# `./bench_hybrid mt` run them one at a time.
+bench_hybrid: bench_hybrid.c plumshash.h hybrid_intern.h
+	$(CC) $(CFLAGS) -pthread -o $@ bench_hybrid.c
+
 # ── gates ────────────────────────────────────────────────────────────────
 # Quality gate: ASan/UBSan edge checks + quality suite + combination
 # reproduction + security audit + intern-pool stress. Run after any change.
@@ -94,10 +100,12 @@ test: all
 # or pin to a core: make bench RUNS=5 PIN=0
 RUNS ?=
 PIN  ?=
-bench: bench_compete test_speed
+bench: bench_compete test_speed bench_hybrid
 	python3 bench_min7.py $(if $(RUNS),--runs $(RUNS),) $(if $(PIN),--pin $(PIN),) > bench_results.txt
 	@echo "  -> bench_results.txt (tables)"
 	./test_speed
+	@echo "  -> intern pool (single-threaded and multi-threaded sections kept separate)"
+	./bench_hybrid
 
 clean:
 	rm -f $(BINS)
