@@ -118,7 +118,9 @@ Strings are routed by size (`len <= SHORT_MAX_LEN`, default 48) into a short
 or a long pool; each pool carries its own T0/T1 pair and its own arena. All
 string bytes live in immutable bump arenas, so `hybrid_str()` is zero-copy —
 it returns a pointer, valid until pool destroy (T1) or the epoch boundary
-(T0). Reads are lock-free, writes are serialized by a pthread mutex, and a
+(T0). Reads are lock-free, writes are serialized by a per-pool spinlock (the
+critical sections are a slot claim or a table rebuild, so a futex round trip
+costs more than the work it protects), and a
 handle is an opaque 64-bit **location** — `{magic | pool | epoch | gen |
 chunk | offset}` (`SF_Handle`, `SF_NULL`) — that names a spot in the arena, not
 a slot in the table. A lookup therefore touches the arena only: the table is
@@ -204,7 +206,8 @@ assert(hybrid_str(hp, tmp, NULL) == NULL);        /* stale after the boundary */
 hybrid_destroy(hp);
 ```
 
-Compile: `-O3 -std=c11 -march=native -pthread`. Tuning knobs are `#ifndef`-
+Compile: `-O3 -std=c11 -march=native` (no pthread needed — the pool's lock is
+a spinlock). Tuning knobs are `#ifndef`-
 guarded at the top of the header: `SHORT_MAX_LEN` (48), `LONG_LOAD_NUM` /
 `LONG_LOAD_DEN` (3/4), `IP_AVG_STRLEN` (32), `IP_CHUNK_MIN` (256 KB),
 `LONG_MAX_CHUNKS` (256), `IP_ARENA_ALIGN` (16).

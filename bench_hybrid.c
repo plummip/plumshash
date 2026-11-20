@@ -208,7 +208,6 @@ static void bench_long_string(uint32_t size, uint32_t count) {
     buf[size - 1] = '\0';
 
     HYBRID_SCOPED(hp, 31, count * (uint32_t)reps, count * (uint32_t)reps);
-    uint64_t ops = 0;
     char extra[128];
 
     double best = 1e30;
@@ -219,27 +218,26 @@ static void bench_long_string(uint32_t size, uint32_t count) {
             double t0 = now_sec();
             SF_Handle h = hybrid_intern(hp, buf, size);
             dt += now_sec() - t0;
-            ops++;
             if (h.u == 0) break;
         }
         if (dt < best) best = dt;
     }
     snprintf(extra, sizeof extra, "size=%u count=%u", size, count);
-    report("st", "long_string_miss", best, ops, extra);
+    report("st", "long_string_miss", best, count, extra);
 
     best = 1e30;
     for (int r = 0; r < reps; r++) {
         double dt = 0;
         for (uint32_t i = 0; i < count; i++) {
-            buf[8] = (char)('a' + (i % 26));
+            /* the SAME string as the miss pass — this is a dedup, not a
+             * second insert */
             double t0 = now_sec();
             hybrid_intern(hp, buf, size);
             dt += now_sec() - t0;
-            ops++;
         }
         if (dt < best) best = dt;
     }
-    report("st", "long_string_hit", best, ops, extra);
+    report("st", "long_string_hit", best, count, extra);
     free(buf);
 }
 
@@ -280,12 +278,16 @@ static void bench_scratch(uint32_t per_epoch, uint32_t epochs) {
     free(strings);
 
     char extra[128];
+    /* best_intern is ONE epoch's elapsed time, so the divisor is one
+     * epoch's entries — not the total over every rep and epoch. */
     snprintf(extra, sizeof extra, "per_epoch=%u slots=%u", per_epoch, slots);
-    report("st", "scratch_intern", best_intern, ops, extra);
+    report("st", "scratch_intern", best_intern, per_epoch, extra);
     (void)sink;
-    snprintf(extra, sizeof extra, "per_epoch=%u slots=%u cleared=%llu",
-             per_epoch, slots, (unsigned long long)cleared);
-    report("st", "epoch_end", best_epoch, 1, extra);
+    /* the boundary cost, amortised over the entries it dropped */
+    snprintf(extra, sizeof extra, "per_epoch=%u slots=%u cleared=%llu ns_per_entry=%.1f",
+             per_epoch, slots, (unsigned long long)cleared,
+             best_epoch * 1e9 / (double)per_epoch);
+    report("st", "epoch_end", best_epoch, per_epoch, extra);
 }
 
 static void run_single_threaded(uint32_t sweep_max) {
