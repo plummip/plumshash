@@ -106,8 +106,11 @@ static void test_free_slot_resolution(void) {
     uint16_t pool_id = _handle_pool(stable);
 
     hybrid_evict(hp, stable);
-    uint64_t hdr = __atomic_load_n((uint64_t *)&p->headers[rank], __ATOMIC_ACQUIRE);
-    SF_Handle forged = _encode_handle(rank, (uint8_t)hdr, pool_id, IR_TIER_T1);
+    /* Forge a handle for the deleted slot carrying the CURRENT generation,
+     * so the generation check passes and only the deleted state can reject
+     * it. */
+    uint64_t sl = __atomic_load_n(&p->slots[rank], __ATOMIC_ACQUIRE);
+    SF_Handle forged = _encode_handle(rank, IP_SLOT_GEN(sl), pool_id, IR_TIER_T1);
 
     CHECK("free_slot_resolve", hybrid_str(hp, forged, NULL) == NULL);
 

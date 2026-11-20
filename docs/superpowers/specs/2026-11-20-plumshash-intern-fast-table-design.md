@@ -206,32 +206,60 @@ bench section=mt case=threads_intern threads=4 ns=... ops_s=... entries=...
 
 The baseline is captured on the current code before phase 2 starts.
 
-### 4.3 Phase 2 — table redesign
+### 4.3 Phase 2 — table redesign  *(landed: measured results below)*
 
 Per pool:
 
 ```
 ctrl[M]      1 byte per slot   tag(7) | state(1)      -> 2 MB at M = 2^21
-slots[M]     8 bytes per slot  chunk(10) | offset(20) | len(32) | spare(2)
+slots[M]     8 bytes per slot  offset(32) | chunk(8) | tier(1) | fp(15) | gen(8)
 ```
 
 - **Index** from the **full 64-bit** hash: `idx = (uint32_t)h & (M - 1)`.
-- **Tag** from the **top** 7 bits of the hash (`h >> 57`), so tag and index
-  are disjoint — the fast reject finally discriminates same-bucket candidates.
-- **Probe** in groups of 16 (SSE2) or 32 (AVX2): one vector load of the ctrl
-  bytes, `cmpeq` against the broadcast tag, `movemask` → a candidate bitmask;
-  only candidate slots are touched. A group of 16 ctrl bytes is 16 bytes of one
-  cache line — the scan stays in cache while the *entries* live in DRAM.
+- **Fingerprint** from hash bits 41..55 and the **tag** from bits 57..63, both
+  disjoint from the index bits — the old header took its fingerprint from
+  hash bits 8..31, which overlapped the index and made the cheap
+  pre-`memcmp` reject useless for same-bucket candidates.
+- **Probe** in groups of 16 (NEON/SSE2) or 32 (AVX2): one vector load of the
+  ctrl bytes, `cmpeq` against the broadcast tag, `movemask` → a candidate
+  bitmask; only candidate slots are touched. A group of 16 ctrl bytes is half
+  a cache line — the scan stays in cache while the slots live in DRAM.
+  AArch64 has no `movemask`, so the NEON path builds the mask by shifting each
+  compare lane down to one bit and gathering the bits with the usual multiply
+  trick.
 - **Slot array** replaces the 32-byte `Entry` header: 8 B/slot instead of
-  32 B/slot, so the table shrinks **4×** (64 MB → 16 MB at max size) and the
-  ctrl array is 32× denser than the old header array.
-- **Delete** semantics as in phase 0; the tag is preserved in the tombstone so
-  a probe can still skip it correctly.
-- The `Entry` struct disappears; `hash_gen`/`gen`/`chunk_id`/`tier`/`len`/
-  `offset` are replaced by the slot + the arena prefix (§4.4).
+  32 B/slot, so the table shrinks **4x** (64 MB → 16 MB at max size) and the
+  ctrl array is 32x denser than the old header array.
+- **Delete** semantics as in phase 0; the ctrl byte keeps the tombstone state.
+- The string's **length** moved out of the slot into an 8-byte arena prefix
+  (`[len:32][reserved:32]`) that shares a cache line with the first bytes of
+  the string. The slot has no room for a 32-bit length next to the offset,
+  chunk, tier, fingerprint and generation.
 
-Fallback: with no SSE2/AVX2, a scalar loop over the same ctrl bytes (still
-cache-dense) keeps the behaviour identical.
+**Measured on this device** (AArch64 phone, warm CPU, min of 5 repetitions,
+100k short strings):
+
+| case | before | after | |
+|---|---|---|---|
+| intern (miss) | 69 ns | 43–65 ns | -6% .. -38% |
+| intern (hit) | 34 ns | 24–36 ns | -10% .. -30% |
+| lookup | 5.4 ns | 3.3–5.0 ns | -8% .. -39% |
+| probe collisions | 30 547 | 1 362 | **-96%** |
+| table bytes / slot | 32 B | 9 B | **-72%** |
+
+At 10k strings the insert path is ~12% *slower*: the ctrl array and the slot
+array are two cache lines where the old design had one, and that split only
+pays off once the table outgrows the cache. The honest verdict: **a win at
+scale, roughly neutral at small sizes, with a 4x smaller table and 22x fewer
+wasted comparisons.** The phase-2 acceptance targets (1.5x on intern, 2x on
+lookup) are NOT met by this phase alone — the lookup target belongs to phase
+3, where the handle carries the arena location and the table is never touched
+on the read path.
+
+Benchmarking note: this phone downclocks to 384 MHz when idle, and a single
+pass was noisy enough to invent a 30% regression in either direction. The
+bench now warms the CPU for 2 s and reports the best of `REPS` repetitions
+(default 5).
 
 ### 4.4 Phase 3 — location-carrying handle
 

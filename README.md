@@ -164,6 +164,11 @@ resolves to `NULL` — never to torn data.
   asked to hold more live entries than its hint sized it for returns `SF_NULL`
   from `hybrid_intern()` — size the hint for the peak live set, and expect
   evicted slots to be reused rather than reclaimed in place.
+- Every interned string carries an 8-byte arena prefix (its length) in front
+  of its bytes, so the arena costs ~8–24 B more per string depending on the
+  length; `IP_ARENA_ALIGN` (16) sets the granularity. The prefix shares a
+  cache line with the start of the string, so a lookup still reads the length
+  and the data from one line.
 
 ### Quick start
 
@@ -187,7 +192,7 @@ hybrid_destroy(hp);
 Compile: `-O3 -std=c11 -march=native -pthread`. Tuning knobs are `#ifndef`-
 guarded at the top of the header: `SHORT_MAX_LEN` (48), `LONG_LOAD_NUM` /
 `LONG_LOAD_DEN` (3/4), `IP_AVG_STRLEN` (32), `IP_CHUNK_MIN` (256 KB),
-`LONG_MAX_CHUNKS` (256).
+`LONG_MAX_CHUNKS` (256), `IP_ARENA_ALIGN` (16).
 
 Gate: `test_hybrid` — single-thread roundtrip/dedup/boundary sizes, 8 threads
 interning the same set concurrently (one handle per string, no duplicate

@@ -18,16 +18,20 @@
  *                      stops serializing on the pool mutex.
  *
  * Mixing them in one figure hides both: a mutex change barely shows up in a
- * single-threaded run, and cache-locality work is invisible in a
- * contended one.
+ * single-threaded run, and cache-locality work is invisible in a contended
+ * one.
+ *
+ * Every case is run REPS times and the BEST (minimum ns/op) is reported:
+ * a single pass on a phone is noisy enough to invent a 30% regression.
  *
  * Usage:
  *   ./bench_hybrid            both sections (default)
  *   ./bench_hybrid st         single-threaded section only
  *   ./bench_hybrid mt         multi-threaded section only
  *
- * Env: SWEEP_MAX=<n> caps the single-threaded sweep (default 100000,
- * max 1000000).
+ * Env: SWEEP_MAX=<n>  caps the single-threaded sweep (default 100000,
+ *                       max 1000000)
+ *       REPS=<n>       repetitions per case (default 5)
  *
  * Every case prints one stable machine-readable line:
  *
@@ -48,6 +52,7 @@
 #define STR_BYTES   32
 
 static uint64_t rng_state = 0x9E3779B97F4A7C15ULL;
+static int      reps      = 5;
 
 static uint32_t rnd(void) {
     rng_state ^= rng_state << 13;
@@ -62,12 +67,14 @@ static double now_sec(void) {
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 }
 
-/* Unique, fixed-width payloads: "s%08u" + padding, so every string has the
- * same length and the hash cost is comparable across the run. */
-static void fill_strings(char *buf, uint32_t n, uint32_t width) {
+/* Unique, fixed-width payloads: "s%08u" + a repetition tag + padding, so
+ * every string has the same length and every repetition interns NEW
+ * strings (a repeat must be a miss, not a dedup). */
+static void fill_strings(char *buf, uint32_t n, uint32_t width, int rep) {
     for (uint32_t i = 0; i < n; i++) {
         char *p = buf + (size_t)i * width;
         int k = snprintf(p, width, "s%08u", i);
+        k += snprintf(p + k, width - (size_t)k, "r%03d", rep);
         while (k < (int)width) p[k++] = '.';
         p[width - 1] = '\0';
     }
@@ -87,43 +94,70 @@ static void report(const char *section, const char *case_name, double secs,
  * SINGLE-THREADED SECTION — per-operation latency, one caller
  * ═══════════════════════════════════════════════════════════════════════ */
 
-/* intern: unique strings (insert path) */
+/* intern: unique strings (insert path). Returns the best ns/op.
+ *
+ * Each repetition gets a FRESH pool: the strings of repetition r are new
+ * (so every intern is a miss), and the pool is created outside the timed
+ * region — sizing and zeroing the table is not part of the measurement. */
 static double bench_intern_miss(uint32_t n, char *strings, uint32_t width,
-                                HybridPool *hp, uint64_t *ops_out,
+                                uint16_t pool_id, uint64_t *ops_out,
                                 char *extra, size_t extra_cap) {
-    double t0 = now_sec();
-    for (uint32_t i = 0; i < n; i++) {
-        const char *s = strings + (size_t)i * width;
-        if (hybrid_intern(hp, s, (uint32_t)strlen(s)).u == 0) {
-            fprintf(stderr, "bench: intern failed at %u (pool full?)\n", i);
+    double best = 1e30;
+    uint64_t ops = 0;
+    for (int r = 0; r < reps; r++) {
+        fill_strings(strings, n, width, r);
+        HybridPool *hp = hybrid_create(pool_id, n, n);
+        if (!hp) break;
+        double t0 = now_sec();
+        uint64_t done = 0;
+        for (uint32_t i = 0; i < n; i++) {
+            const char *s = strings + (size_t)i * width;
+            if (hybrid_intern(hp, s, (uint32_t)strlen(s)).u == 0) break;
+            done++;
+        }
+        double dt = now_sec() - t0;
+        if (done == n && dt < best) best = dt;
+        ops = done;
+        HybridStats st = hybrid_stats(hp);
+        snprintf(extra, extra_cap, "entries=%u slots=%u collisions=%u",
+                 st.short_entries + st.long_entries,
+                 st.short_max + st.long_max,
+                 st.short_collisions + st.long_collisions);
+        hybrid_destroy(hp);
+        if (done != n) {
+            fprintf(stderr, "bench: intern failed at %llu (pool full?)\n",
+                    (unsigned long long)done);
             break;
         }
     }
-    double dt = now_sec() - t0;
-    *ops_out = n;
-    HybridStats st = hybrid_stats(hp);
-    snprintf(extra, extra_cap, "entries=%u slots=%u collisions=%u",
-             st.short_entries + st.long_entries,
-             st.short_max + st.long_max,
-             st.short_collisions + st.long_collisions);
-    return dt;
+    *ops_out = ops;
+    return best;
 }
 
 /* intern: the same strings again (dedup path: probe + memcmp) */
 static double bench_intern_hit(uint32_t n, char *strings, uint32_t width,
                                HybridPool *hp, uint64_t *ops_out,
                                char *extra, size_t extra_cap) {
-    double t0 = now_sec();
-    for (uint32_t i = 0; i < n; i++) {
-        const char *s = strings + (size_t)i * width;
-        hybrid_intern(hp, s, (uint32_t)strlen(s));
+    double best = 1e30;
+    uint64_t ops = 0;
+    for (int r = 0; r < reps; r++) {
+        fill_strings(strings, n, width, 0);
+        for (uint32_t i = 0; i < n; i++)
+            hybrid_intern(hp, strings + (size_t)i * width, (uint32_t)strlen(strings + (size_t)i * width));
+        double t0 = now_sec();
+        for (uint32_t i = 0; i < n; i++) {
+            const char *s = strings + (size_t)i * width;
+            hybrid_intern(hp, s, (uint32_t)strlen(s));
+        }
+        double dt = now_sec() - t0;
+        if (dt < best) best = dt;
+        ops = n;
     }
-    double dt = now_sec() - t0;
-    *ops_out = n;
+    *ops_out = ops;
     HybridStats st = hybrid_stats(hp);
     snprintf(extra, extra_cap, "entries=%u",
              st.short_entries + st.long_entries);
-    return dt;
+    return best;
 }
 
 /* lookup: lock-free read path over live handles */
@@ -133,6 +167,7 @@ static double bench_lookup(uint32_t n, char *strings, uint32_t width,
     SF_Handle *h = malloc(sizeof(SF_Handle) * n);
     if (!h) return 0;
     uint32_t got = 0;
+    fill_strings(strings, n, width, 0);
     for (uint32_t i = 0; i < n; i++) {
         const char *s = strings + (size_t)i * width;
         SF_Handle hh = hybrid_intern(hp, s, (uint32_t)strlen(s));
@@ -144,17 +179,21 @@ static double bench_lookup(uint32_t n, char *strings, uint32_t width,
         SF_Handle t = h[i - 1]; h[i - 1] = h[j]; h[j] = t;
     }
     volatile uint64_t sink = 0;
-    double t0 = now_sec();
-    for (uint32_t i = 0; i < got; i++) {
-        const char *p = hybrid_str(hp, h[i], NULL);
-        sink += (uint64_t)(uintptr_t)p;
+    double best = 1e30;
+    for (int r = 0; r < reps; r++) {
+        double t0 = now_sec();
+        for (uint32_t i = 0; i < got; i++) {
+            const char *p = hybrid_str(hp, h[i], NULL);
+            sink += (uint64_t)(uintptr_t)p;
+        }
+        double dt = now_sec() - t0;
+        if (dt < best) best = dt;
     }
-    double dt = now_sec() - t0;
     *ops_out = got;
     snprintf(extra, extra_cap, "hits=%u", got);
     free(h);
     (void)sink;
-    return dt;
+    return best;
 }
 
 /* long strings: hash + arena copy dominate */
@@ -164,33 +203,39 @@ static void bench_long_string(uint32_t size, uint32_t count) {
     memset(buf, 'x', size);
     buf[size - 1] = '\0';
 
-    HYBRID_SCOPED(hp, 31, count, count);
+    HYBRID_SCOPED(hp, 31, count * (uint32_t)reps, count * (uint32_t)reps);
     uint64_t ops = 0;
     char extra[128];
-    char full[192];
 
-    double dt = 0;
-    for (uint32_t i = 0; i < count; i++) {
-        buf[8] = (char)('a' + (i % 26));           /* keep the strings distinct */
-        double t0 = now_sec();
-        SF_Handle h = hybrid_intern(hp, buf, size);
-        dt += now_sec() - t0;
-        ops++;
-        if (h.u == 0) break;
+    double best = 1e30;
+    for (int r = 0; r < reps; r++) {
+        double dt = 0;
+        for (uint32_t i = 0; i < count; i++) {
+            buf[8] = (char)('a' + (i % 26));           /* keep the strings distinct */
+            double t0 = now_sec();
+            SF_Handle h = hybrid_intern(hp, buf, size);
+            dt += now_sec() - t0;
+            ops++;
+            if (h.u == 0) break;
+        }
+        if (dt < best) best = dt;
     }
     snprintf(extra, sizeof extra, "size=%u count=%u", size, count);
-    report("st", "long_string_miss", dt, ops, extra);
+    report("st", "long_string_miss", best, ops, extra);
 
-    dt = 0;
-    for (uint32_t i = 0; i < count; i++) {
-        buf[8] = (char)('a' + (i % 26));
-        double t0 = now_sec();
-        hybrid_intern(hp, buf, size);
-        dt += now_sec() - t0;
-        ops++;
+    best = 1e30;
+    for (int r = 0; r < reps; r++) {
+        double dt = 0;
+        for (uint32_t i = 0; i < count; i++) {
+            buf[8] = (char)('a' + (i % 26));
+            double t0 = now_sec();
+            hybrid_intern(hp, buf, size);
+            dt += now_sec() - t0;
+            ops++;
+        }
+        if (dt < best) best = dt;
     }
-    snprintf(full, sizeof full, "%s", extra);
-    report("st", "long_string_hit", dt, ops, full);
+    report("st", "long_string_hit", best, ops, extra);
     free(buf);
 }
 
@@ -203,17 +248,16 @@ static void run_single_threaded(uint32_t sweep_max) {
 
         char *strings = malloc((size_t)n * STR_BYTES);
         if (!strings) break;
-        fill_strings(strings, n, STR_BYTES);
 
-        HYBRID_SCOPED(hp, 1, n, n);
         uint64_t ops = 0;
         char extra[160];
         char full[192];
 
-        double dt = bench_intern_miss(n, strings, STR_BYTES, hp, &ops, extra, sizeof extra);
+        double dt = bench_intern_miss(n, strings, STR_BYTES, 1, &ops, extra, sizeof extra);
         snprintf(full, sizeof full, "n=%u %s", n, extra);
         report("st", "intern_miss", dt, ops, full);
 
+        HYBRID_SCOPED(hp, 1, n, n);
         dt = bench_intern_hit(n, strings, STR_BYTES, hp, &ops, extra, sizeof extra);
         snprintf(full, sizeof full, "n=%u %s", n, extra);
         report("st", "intern_hit", dt, ops, full);
@@ -252,38 +296,43 @@ static void *thread_worker(void *arg) {
 }
 
 static void bench_threads(uint32_t nthreads, uint32_t per_thread) {
-    char *strings = malloc((size_t)per_thread * nthreads * STR_BYTES);
-    if (!strings) return;
     uint32_t total = per_thread * nthreads;
-    fill_strings(strings, total, STR_BYTES);
+    char *strings = malloc((size_t)total * STR_BYTES);
+    if (!strings) return;
 
-    HYBRID_SCOPED(hp, 32, total, total);
-    pthread_t th[64];
-    ThreadArg args[64];
-    if (nthreads > 64) nthreads = 64;
-
-    double t0 = now_sec();
-    for (uint32_t t = 0; t < nthreads; t++) {
-        args[t].hp = hp;
-        args[t].strings = strings + (size_t)t * per_thread * STR_BYTES;
-        args[t].width = STR_BYTES;
-        args[t].count = per_thread;
-        args[t].ops = 0;
-        pthread_create(&th[t], NULL, thread_worker, &args[t]);
-    }
+    double best = 1e30;
     uint64_t ops = 0;
-    for (uint32_t t = 0; t < nthreads; t++) {
-        pthread_join(th[t], NULL);
-        ops += args[t].ops;
+    for (int r = 0; r < reps; r++) {
+        fill_strings(strings, total, STR_BYTES, r);
+        HYBRID_SCOPED(hp, 32, total, total);
+        pthread_t th[64];
+        ThreadArg args[64];
+        if (nthreads > 64) nthreads = 64;
+
+        double t0 = now_sec();
+        for (uint32_t t = 0; t < nthreads; t++) {
+            args[t].hp = hp;
+            args[t].strings = strings + (size_t)t * per_thread * STR_BYTES;
+            args[t].width = STR_BYTES;
+            args[t].count = per_thread;
+            args[t].ops = 0;
+            pthread_create(&th[t], NULL, thread_worker, &args[t]);
+        }
+        uint64_t done = 0;
+        for (uint32_t t = 0; t < nthreads; t++) {
+            pthread_join(th[t], NULL);
+            done += args[t].ops;
+        }
+        double dt = now_sec() - t0;
+        if (dt < best) best = dt;
+        ops = done;
     }
-    double dt = now_sec() - t0;
+    free(strings);
 
     char extra[128];
-    HybridStats st = hybrid_stats(hp);
-    snprintf(extra, sizeof extra, "threads=%u entries=%u", nthreads,
-             st.short_entries + st.long_entries);
-    report("mt", "threads_intern", dt, ops, extra);
-    free(strings);
+    snprintf(extra, sizeof extra, "threads=%u ops=%llu", nthreads,
+             (unsigned long long)ops);
+    report("mt", "threads_intern", best, ops, extra);
 }
 
 static void run_multi_threaded(void) {
@@ -300,8 +349,21 @@ int main(int argc, char **argv) {
     const char *env = getenv("SWEEP_MAX");
     if (env) sweep_max = (uint32_t)strtoul(env, NULL, 10);
     if (sweep_max > MAX_STRINGS) sweep_max = MAX_STRINGS;
+    env = getenv("REPS");
+    if (env) { reps = (int)strtol(env, NULL, 10); if (reps < 1) reps = 1; }
 
-    printf("# plumshash intern bench\n");
+    /* Warm the CPU up: the first case measured would otherwise run at a
+     * lower clock and look 30% slower than it is. */
+    {
+        volatile uint64_t sink = 0;
+        double t0 = now_sec();
+        while (now_sec() - t0 < 2.0) {
+            for (int i = 0; i < 100000; i++) sink += (uint64_t)i;
+        }
+        (void)sink;
+    }
+
+    printf("# plumshash intern bench (reps=%d)\n", reps);
 
     if (!strcmp(mode, "st") || !strcmp(mode, "all")) run_single_threaded(sweep_max);
     if (!strcmp(mode, "mt") || !strcmp(mode, "all")) run_multi_threaded();

@@ -45,8 +45,11 @@
 #include <assert.h>
 #include <time.h>
 #include <pthread.h>
-#ifdef __AVX2__
+#if defined(__AVX2__) || defined(__SSE2__)
 #include <immintrin.h>
+#endif
+#if defined(__ARM_NEON) || defined(__aarch64__)
+#include <arm_neon.h>
 #endif
 #ifdef __linux__
 #include <sys/random.h>   /* getrandom */
@@ -83,6 +86,14 @@
 #endif
 #ifndef IP_CHUNK_MIN
 # define IP_CHUNK_MIN (256 * 1024)
+#endif
+/* Arena allocation granularity. Every interned string carries an 8-byte
+ * prefix (length + reserved), so the granularity is the floor on the
+ * per-string overhead: 16 bytes keeps it at ~8-24 B/string instead of the
+ * 32 B/string a 32-byte granularity would cost. The AVX2 compare never
+ * reads past the string, so the stored side needs no 32-byte slack. */
+#ifndef IP_ARENA_ALIGN
+# define IP_ARENA_ALIGN 16
 #endif
 #ifndef HYBRID_INTERN_MAX_LEN
 /* Leave headroom for 32-byte arena rounding without uint32 overflow. */
@@ -161,7 +172,8 @@ typedef struct {
 } Arena;
 
 static DataChunk *_arena_chunk_new(uint32_t cap) {
-    cap = cap > UINT32_MAX - 31u ? UINT32_MAX : ((cap + 31u) & ~31u);
+    cap = cap > UINT32_MAX - (IP_ARENA_ALIGN - 1u) ? UINT32_MAX
+         : ((cap + (IP_ARENA_ALIGN - 1u)) & ~(uint32_t)(IP_ARENA_ALIGN - 1u));
     if ((size_t)cap > SIZE_MAX - sizeof(DataChunk)) return NULL;
     DataChunk *c = (DataChunk *)malloc(sizeof(DataChunk) + cap);
     assert(c);
@@ -183,8 +195,8 @@ static void _arena_free(Arena *a) {
 
 static bool _arena_alloc(Arena *a, uint32_t len, uint8_t *cid_out, uint32_t *off_out) {
     if (len > HYBRID_INTERN_MAX_LEN) return false;
-    uint32_t need = (len + 31u) & ~31u;
-    if (!need) need = 32;
+    uint32_t need = (len + (IP_ARENA_ALIGN - 1u)) & ~(uint32_t)(IP_ARENA_ALIGN - 1u);
+    if (!need) need = IP_ARENA_ALIGN;
     uint8_t cid = a->cur_chunk;
     DataChunk *cur = a->chunks[cid];
     uint32_t off = atomic_load_explicit(&cur->bump, memory_order_relaxed);
@@ -216,17 +228,22 @@ static bool _arena_alloc(Arena *a, uint32_t len, uint8_t *cid_out, uint32_t *off
 }
 
 /* ----------------------------------------------------------------------
- * POOL — slot-indexed headers + T0/T1 arenas + fingerprint
+ * POOL — ctrl-byte table + 8-byte slots + T0/T1 arenas
  * ---------------------------------------------------------------------- */
-/* Slot state.
+/* The table is split in two:
  *
- * LK_TOMB is a deleted slot. The probe chain runs PAST it — only LK_FREE
- * ends a chain — but a later insert on the same chain may reuse it. Without
- * the tombstone, freeing a slot cuts the chain: a lookup for a string that
- * lives further down the same chain stops at the hole and never finds it,
- * so the re-intern inserts a DUPLICATE instead of resolving the existing
- * entry. */
-typedef enum : uint8_t { LK_FREE = 0, LK_OWNED = 1, LK_TOMB = 2 } EntryKind;
+ *   ctrl[M]   one byte per slot. 0x00 = never used (ends a probe chain),
+ *             0x80 = deleted (tombstone — the chain runs PAST it), any
+ *             other value = the 7-bit tag of the entry in that slot.
+ *   slots[M]  eight bytes per slot: where the bytes live, which arena, a
+ *             wider fingerprint, and the slot generation.
+ *
+ * The ctrl array is 32x denser than the old 32-byte header, so a probe
+ * checks 32 slots per cache line and mostly stays in cache; the slot array
+ * is touched only when a tag actually matches.
+ */
+#define IP_CTRL_EMPTY    0x00u
+#define IP_CTRL_DELETED  0x80u
 
 /* The tombstone model (and the tombstone counters in HybridStats) arrived
  * with hybrid_intern 1.1. Tests that want to run against an older header
@@ -234,20 +251,53 @@ typedef enum : uint8_t { LK_FREE = 0, LK_OWNED = 1, LK_TOMB = 2 } EntryKind;
 #define HYBRID_INTERN_HAS_TOMBSTONES 1
 enum { TIER_T0 = 0, TIER_T1 = 1 };
 
-typedef struct __attribute__((aligned(4))) {
-    uint32_t hash_gen;          /* [31:8] = 24-bit hash, [7:0] = monotonic gen */
-    uint8_t  kind;              /* LK_FREE / LK_OWNED */
-    uint8_t  chunk_id;
-    uint8_t  tier;              /* TIER_T0 / TIER_T1 — which arena */
-    uint8_t  _pad0;
-    uint32_t len;               /* full uint32 length */
-    uint32_t offset;
-    uint8_t  _pad1[16];
-} Entry;
-_Static_assert(sizeof(Entry) == 32, "Entry must be 32 bytes");
+/* Slot layout (64 bits):
+ *   bits  0..31  arena offset
+ *   bits 32..39  arena chunk id
+ *   bit  40      tier (T0 scratch / T1 stable)
+ *   bits 41..55  fingerprint (15 bits)
+ *   bits 56..63  slot generation
+ *
+ * The length is NOT in the slot: it lives in the arena prefix, in the same
+ * cache line as the first bytes of the string. */
+typedef uint64_t IpSlot;
+
+#define IP_SLOT_OFFSET(u) ((uint32_t)((u) & 0xFFFFFFFFu))
+#define IP_SLOT_CHUNK(u)  ((uint8_t)(((u) >> 32) & 0xFFu))
+#define IP_SLOT_TIER(u)   ((uint8_t)(((u) >> 40) & 0x1u))
+#define IP_SLOT_FP(u)     ((uint16_t)(((u) >> 41) & 0x7FFFu))
+#define IP_SLOT_GEN(u)    ((uint8_t)(((u) >> 56) & 0xFFu))
+#define IP_SLOT_MAKE(off, chunk, tier, fp, gen)                  \
+    ((uint64_t)(off) | ((uint64_t)(chunk) << 32) |               \
+     ((uint64_t)(tier) << 40) | ((uint64_t)(fp) << 41) |         \
+     ((uint64_t)(gen) << 56))
+
+/* Tag and fingerprint come from disjoint parts of the hash, and both are
+ * disjoint from the index bits. The old header took its fingerprint from
+ * hash bits 8..31, which OVERLAPPED the index (bits 0..20) — so the cheap
+ * pre-memcmp reject could not discriminate same-bucket candidates at all.
+ * The index now uses the full 64-bit hash instead of a 32-bit truncation. */
+#define IP_HASH_TAG(h) ((uint8_t)(((h) >> 57) & 0x7Fu))
+#define IP_HASH_FP(h)  ((uint16_t)(((h) >> 41) & 0x7FFFu))
+
+/* Probe group size: one vector load of ctrl bytes per step. */
+#if defined(__AVX2__)
+# define IP_GROUP 32
+#elif defined(__SSE2__)
+# define IP_GROUP 16
+#else
+# define IP_GROUP 16
+#endif
+
+/* Every interned string is stored as an 8-byte prefix followed by its
+ * bytes: [len:32][reserved:32][bytes...]. The prefix shares a cache line
+ * with the first bytes of the string, so a lookup reads the length and the
+ * data from one line. */
+typedef struct { uint32_t len; uint32_t reserved; } IpPrefix;
 
 typedef struct {
-    Entry            *headers;
+    uint8_t           *ctrl;     /* 1 byte per slot */
+    IpSlot           *slots;    /* 8 bytes per slot */
     Arena             t0;       /* scratch — bulk-freed at epoch_end */
     Arena             t1;       /* stable — freed at destroy */
     uint32_t          M;
@@ -261,25 +311,13 @@ typedef struct {
     pthread_mutex_t   lock;
 } Pool;
 
-static inline const uint8_t *_entry_data(const Pool *p, const Entry *eh) {
-    const Arena *a = eh->tier == TIER_T1 ? &p->t1 : &p->t0;
-    return a->chunks[eh->chunk_id]->data + eh->offset;
+/* Where a slot's string lives: the arena prefix, then the bytes. */
+static inline const uint8_t *_slot_base(const Pool *p, uint64_t sl) {
+    const Arena *a = IP_SLOT_TIER(sl) == TIER_T1 ? &p->t1 : &p->t0;
+    return a->chunks[IP_SLOT_CHUNK(sl)]->data + IP_SLOT_OFFSET(sl);
 }
 
-/* Decode entry location from the two atomically published header words.
- * Word 0 = hash/gen + kind/chunk/tier; word 1 = len/offset. */
-static inline const uint8_t *_entry_data_snapshot(const Pool *p,
-                                                   uint64_t hdr0,
-                                                   uint64_t hdr1) {
-    uint8_t tier = (uint8_t)(hdr0 >> 48);
-    uint8_t chunk = (uint8_t)(hdr0 >> 40);
-    uint32_t offset = (uint32_t)(hdr1 >> 32);
-    const Arena *a = tier == TIER_T1 ? &p->t1 : &p->t0;
-    return a->chunks[chunk]->data + offset;
-}
-
-static inline bool _entry_matches(const Pool *p, const Entry *eh, const char *s, uint32_t len) {
-    const uint8_t *ed = _entry_data(p, eh);
+static inline bool _bytes_equal(const uint8_t *ed, const char *s, uint32_t len) {
 #ifdef __AVX2__
     uint32_t i = 0;
     for (; i + 32 <= len; i += 32) {
@@ -299,13 +337,64 @@ static inline bool _entry_matches(const Pool *p, const Entry *eh, const char *s,
 #endif
 }
 
-/* Publish word 1 (len/offset) then word 0 (hash/gen/kind/chunk/tier) LAST
- * with release, so a lock-free reader that acquires word 0 sees word 1. */
-static inline void _store_header(Entry *dst, const Entry *src) {
-    const uint64_t *s = (const uint64_t *)src;
-    uint64_t *d = (uint64_t *)dst;
-    __atomic_store_n(d + 1, s[1], __ATOMIC_RELAXED);
-    __atomic_store_n(d,     s[0], __ATOMIC_RELEASE);
+static inline uint32_t _ctz32(uint32_t v) {
+#if defined(__GNUC__) || defined(__clang__)
+    return (uint32_t)__builtin_ctz(v);
+#else
+    uint32_t n = 0; while (!(v & 1u)) { v >>= 1; n++; } return n;
+#endif
+}
+
+#if defined(__ARM_NEON) || defined(__aarch64__)
+/* NEON has no movemask: the compare result is 0xFF per matching lane, so
+ * the mask is built by shifting each lane down to one bit and gathering
+ * the bits with the usual multiply trick. */
+static inline uint32_t _neon_mask16(uint8x16_t m) {
+    uint8x16_t s = vshrq_n_u8(m, 7);            /* 0xFF lanes -> 0x01 lanes */
+    uint64_t lo = vget_lane_u64(vreinterpret_u64_u8(vget_low_u8(s)), 0);
+    uint64_t hi = vget_lane_u64(vreinterpret_u64_u8(vget_high_u8(s)), 0);
+    lo = ((lo & 0x0101010101010101ULL) * 0x0102040810204080ULL) >> 56;
+    hi = ((hi & 0x0101010101010101ULL) * 0x0102040810204080ULL) >> 56;
+    return (uint32_t)lo | ((uint32_t)hi << 8);
+}
+#endif
+
+/* Scan one group of ctrl bytes: which slots carry our tag, which are
+ * deleted, which are still empty. One vector load, three compares. */
+static inline void _ctrl_scan(const uint8_t *c, uint8_t tag,
+                              uint32_t *match, uint32_t *deleted,
+                              uint32_t *empty) {
+#if defined(__AVX2__)
+    __m256i v  = _mm256_loadu_si256((const __m256i *)c);
+    __m256i tv = _mm256_set1_epi8((char)tag);
+    __m256i dv = _mm256_set1_epi8((char)IP_CTRL_DELETED);
+    __m256i ev = _mm256_setzero_si256();
+    *match   = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, tv));
+    *deleted = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, dv));
+    *empty   = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, ev));
+#elif defined(__SSE2__)
+    __m128i v  = _mm_loadu_si128((const __m128i *)c);
+    __m128i tv = _mm_set1_epi8((char)tag);
+    __m128i dv = _mm_set1_epi8((char)IP_CTRL_DELETED);
+    __m128i ev = _mm_setzero_si128();
+    *match   = (uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(v, tv));
+    *deleted = (uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(v, dv));
+    *empty   = (uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(v, ev));
+#elif defined(__ARM_NEON) || defined(__aarch64__)
+    uint8x16_t v  = vld1q_u8(c);
+    *match   = _neon_mask16(vceqq_u8(v, vdupq_n_u8(tag)));
+    *deleted = _neon_mask16(vceqq_u8(v, vdupq_n_u8((uint8_t)IP_CTRL_DELETED)));
+    *empty   = _neon_mask16(vceqq_u8(v, vdupq_n_u8(0)));
+#else
+    uint32_t m = 0, d = 0, e = 0;
+    for (uint32_t i = 0; i < IP_GROUP; i++) {
+        uint32_t bit = 1u << i;
+        if (c[i] == tag)                 m |= bit;
+        else if (c[i] == IP_CTRL_DELETED) d |= bit;
+        else if (c[i] == IP_CTRL_EMPTY)   e |= bit;
+    }
+    *match = m; *deleted = d; *empty = e;
+#endif
 }
 
 static Pool *pool_create(uint16_t pool_id, uint32_t expected, uint64_t seed) {
@@ -318,14 +407,16 @@ static Pool *pool_create(uint16_t pool_id, uint32_t expected, uint64_t seed) {
 
     Pool *p = (Pool *)calloc(1, sizeof(Pool));
     if (!p) return NULL;
-    p->headers = (Entry *)aligned_alloc(64, (size_t)M * sizeof(Entry));
-    if (!p->headers) { free(p); return NULL; }
+    size_t ctrl_bytes = ((size_t)M + 63u) & ~(size_t)63u;   /* aligned_alloc needs a multiple */
+    p->ctrl = (uint8_t *)aligned_alloc(64, ctrl_bytes);
+    p->slots = (IpSlot *)aligned_alloc(64, ((size_t)M * sizeof(IpSlot) + 63u) & ~(size_t)63u);
+    if (!p->ctrl || !p->slots) { free(p->ctrl); free(p->slots); free(p); return NULL; }
     p->M = M;
     p->pool_id = pool_id;
     p->seed = seed;
     p->max_entries = (uint32_t)(M * LONG_LOAD_NUM / LONG_LOAD_DEN);
     pthread_mutex_init(&p->lock, NULL);
-    memset(p->headers, 0, M * sizeof(Entry));
+    memset(p->ctrl, 0, ctrl_bytes);
 
     uint64_t cap64 = (uint64_t)expected * IP_AVG_STRLEN;
     uint32_t cap = cap64 > UINT32_MAX ? UINT32_MAX : (uint32_t)cap64;
@@ -339,103 +430,122 @@ static void pool_destroy(Pool *p) {
     if (!p) return;
     _arena_free(&p->t0);
     _arena_free(&p->t1);
-    free(p->headers); free(p);
+    free(p->ctrl); free(p->slots); free(p);
 }
 
 /* The tier a handle carries for a given entry tier. */
 static inline uint64_t _tier_bits(uint8_t tier) { return tier == TIER_T1 ? IR_TIER_T1 : IR_TIER_T0; }
 
+/* Walk the probe chain for (h, len, s).
+ *
+ * Sets match_slot (and match_gen) when an existing entry is found, else
+ * insert_slot — the slot where a new entry goes. The chain is scanned a
+ * group at a time: one vector load of ctrl bytes per step, and the slot
+ * array is touched only for slots whose tag matches. */
+static void _pool_probe(Pool *p, uint64_t h, uint32_t len,
+                        const char *s, uint8_t tier,
+                        uint32_t *match_slot, uint8_t *match_gen,
+                        uint32_t *insert_slot) {
+    const uint32_t M = p->M;
+    const uint32_t home = (uint32_t)h & (M - 1);
+    uint8_t  tag = IP_HASH_TAG(h);
+    if (!tag) tag = 1;                       /* 0 means "never used" */
+    const uint16_t fp = IP_HASH_FP(h);
+
+    const uint32_t gmask = IP_GROUP - 1;
+    uint32_t group = home & ~gmask;
+    const uint32_t groups = M / IP_GROUP;
+    uint32_t first_del = UINT32_MAX;
+
+    *match_slot = UINT32_MAX;
+    *match_gen = 0;
+    *insert_slot = UINT32_MAX;
+
+    for (uint32_t g = 0; g < groups; g++) {
+        uint32_t mm, dm, em;
+        _ctrl_scan(p->ctrl + group, tag, &mm, &dm, &em);
+        if (g == 0 && (home & gmask)) {
+            /* slots before `home` in the first group belong to other chains */
+            uint32_t before = (1u << (home & gmask)) - 1u;
+            mm &= ~before; dm &= ~before; em &= ~before;
+        }
+        while (mm) {
+            uint32_t i = _ctz32(mm);
+            mm &= mm - 1;
+            uint32_t slot = group + i;
+            uint64_t sl = __atomic_load_n(&p->slots[slot], __ATOMIC_RELAXED);
+            atomic_fetch_add_explicit(&p->n_collisions, 1, memory_order_relaxed);
+            if (IP_SLOT_FP(sl) != fp) continue;
+            if (IP_SLOT_TIER(sl) != tier) continue;
+            const uint8_t *base = _slot_base(p, sl);
+            uint32_t elen = ((const IpPrefix *)base)->len;
+            if (elen != len) continue;
+            if (!_bytes_equal(base + sizeof(IpPrefix), s, len)) continue;
+            *match_slot = slot;
+            *match_gen = IP_SLOT_GEN(sl);
+            return;
+        }
+        if (first_del == UINT32_MAX && dm) {
+            uint32_t i = _ctz32(dm);
+            first_del = group + i;
+        }
+        if (em) {
+            /* The chain ends in this group. Insert at the first tombstone we
+             * passed (a tombstone is a usable slot), else at the first empty
+             * slot. */
+            uint32_t i = _ctz32(em);
+            *insert_slot = (first_del != UINT32_MAX) ? first_del : (group + i);
+            return;
+        }
+        group = (group + IP_GROUP) & (M - 1);
+    }
+    /* The whole table was walked: no empty slot, but maybe a tombstone. */
+    *insert_slot = first_del;
+}
+
 static SF_Handle pool_intern(Pool *p, const char *s, uint32_t len, uint8_t tier) {
-    if (len > HYBRID_INTERN_MAX_LEN || (len != 0 && s == NULL)) return SF_NULL;
+    /* The arena prefix (8 bytes) rides along with every string, so the
+     * usable length is 8 less than the arena limit. */
+    if (len > HYBRID_INTERN_MAX_LEN - 8u || (len != 0 && s == NULL)) return SF_NULL;
     uint64_t h = plumshash(s, len, p->seed);
-    uint32_t h32 = (uint32_t)h;
-    uint32_t pos = h32 & (p->M - 1);
     Arena *a = tier == TIER_T1 ? &p->t1 : &p->t0;
 
     _lock(&p->lock);
     _seq_begin(&p->seq);
     SF_Handle out = SF_NULL;
-    uint32_t first_tomb = UINT32_MAX;   /* earliest deleted slot on this chain */
-    uint32_t insert_slot = UINT32_MAX;  /* where a new entry would go */
-    uint32_t match_slot = UINT32_MAX;   /* an existing entry was found */
-    uint8_t  match_gen = 0;
-    int      insert_is_tomb = 0;
-
-    for (uint32_t probe = 0; probe < p->M; probe++) {
-        uint32_t p2 = (pos + probe) & (p->M - 1);
-        Entry *eh = &p->headers[p2];
-        uint64_t hdr = __atomic_load_n((uint64_t *)eh, __ATOMIC_RELAXED);
-        uint8_t kind = (uint8_t)(hdr >> 32);
-
-        if (kind == LK_TOMB) {
-            /* Deleted slot: keep walking the chain, but remember it so the
-             * insert below can reuse it instead of growing the table. */
-            if (first_tomb == UINT32_MAX) first_tomb = p2;
-            atomic_fetch_add_explicit(&p->n_collisions, 1, memory_order_relaxed);
-            continue;
-        }
-
-        if (kind == LK_FREE) {
-            /* Claim the earliest tombstone we passed, else this free slot. */
-            if (first_tomb != UINT32_MAX) {
-                insert_slot = first_tomb;
-                insert_is_tomb = 1;
-            } else {
-                insert_slot = p2;
-            }
-            break;
-        }
-
-        /* LK_OWNED */
-        uint32_t hg = (uint32_t)hdr;
-        uint64_t hdr1 = __atomic_load_n((uint64_t *)eh + 1, __ATOMIC_RELAXED);
-        uint32_t elen = (uint32_t)hdr1;
-        uint8_t etier = (uint8_t)(hdr >> 48);
-        if (etier == tier && ((hg ^ ((uint32_t)h32 << 8)) < 0x100u) && elen == len
-            && _entry_matches(p, eh, s, len)) {
-            match_slot = p2; match_gen = (uint8_t)hg;
-            break;
-        }
-        atomic_fetch_add_explicit(&p->n_collisions, 1, memory_order_relaxed);
-    }
-
-    /* The chain held no free slot, but it did hold a deleted one. A
-     * tombstone IS a usable slot: without this the pool reports "full"
-     * while a perfectly good slot sits deleted on the chain. The whole
-     * chain was walked, so no duplicate was missed either. */
-    if (match_slot == UINT32_MAX && insert_slot == UINT32_MAX &&
-        first_tomb != UINT32_MAX) {
-        insert_slot = first_tomb;
-        insert_is_tomb = 1;
-    }
+    uint32_t match_slot, insert_slot;
+    uint8_t  match_gen;
+    _pool_probe(p, h, len, s, tier, &match_slot, &match_gen, &insert_slot);
 
     if (match_slot != UINT32_MAX) {
         out = _encode_handle(match_slot, match_gen, p->pool_id, _tier_bits(tier));
     } else if (insert_slot != UINT32_MAX) {
-        Entry *target = &p->headers[insert_slot];
-        uint64_t thdr = __atomic_load_n((uint64_t *)target, __ATOMIC_RELAXED);
-
+        uint32_t total = (len + 8u + (IP_ARENA_ALIGN - 1u)) & ~(uint32_t)(IP_ARENA_ALIGN - 1u);
         uint8_t cid; uint32_t off;
-        if (_arena_alloc(a, len, &cid, &off)) {
-            uint8_t *dst = a->chunks[cid]->data + off;
+        if (_arena_alloc(a, len + 8u, &cid, &off)) {
+            uint8_t *base = a->chunks[cid]->data + off;
+            IpPrefix *pfx = (IpPrefix *)base;
+            uint8_t *dst = base + sizeof(IpPrefix);
+            uint32_t padded = total - (uint32_t)sizeof(IpPrefix);
+            pfx->len = len;
+            pfx->reserved = 0;
             if (len) memcpy(dst, s, len);
-            uint32_t padded = (len + 31) & ~31;
-            if (padded == 0) padded = 32;
             if (padded > len) memset(dst + len, 0, padded - len);
 
-            uint8_t gen = (uint8_t)(thdr & 0xFF) + 1;
-            if (gen == 0) gen = 1;
+            uint64_t old = __atomic_load_n(&p->slots[insert_slot], __ATOMIC_RELAXED);
+            uint8_t gen = (uint8_t)(IP_SLOT_GEN(old) + 1);
+            if (!gen) gen = 1;
+            uint64_t sl = IP_SLOT_MAKE(off, cid, tier, IP_HASH_FP(h), gen);
+            __atomic_store_n(&p->slots[insert_slot], sl, __ATOMIC_RELAXED);
 
-            Entry ne = {0};
-            ne.hash_gen = ((uint32_t)h32 << 8) | gen;
-            ne.len = len;
-            ne.kind = LK_OWNED;
-            ne.chunk_id = cid;
-            ne.offset = off;
-            ne.tier = tier;
-            _store_header(target, &ne);
+            uint8_t tag = IP_HASH_TAG(h);
+            if (!tag) tag = 1;
+            uint8_t old_ctrl = __atomic_load_n(&p->ctrl[insert_slot], __ATOMIC_RELAXED);
+            /* Publish the ctrl byte LAST: a reader that sees OCCUPIED also
+             * sees the slot and the string bytes. */
+            __atomic_store_n(&p->ctrl[insert_slot], tag, __ATOMIC_RELEASE);
             atomic_fetch_add_explicit(&p->n_entries, 1, memory_order_relaxed);
-            if (insert_is_tomb)
+            if (old_ctrl == IP_CTRL_DELETED)
                 atomic_fetch_sub_explicit(&p->n_tombs, 1, memory_order_relaxed);
             out = _encode_handle(insert_slot, gen, p->pool_id, _tier_bits(tier));
         }
@@ -452,24 +562,22 @@ static void pool_evict(Pool *p, SF_Handle h) {
     uint8_t  gen = _handle_gen(h);
     uint8_t  want_tier = _handle_tier(h);
     if (want_tier != IR_TIER_T0 && want_tier != IR_TIER_T1) return;
+    uint8_t tier = (want_tier == IR_TIER_T1) ? TIER_T1 : TIER_T0;
     _lock(&p->lock);
     _seq_begin(&p->seq);
-    Entry *eh = &p->headers[pos];
-    uint64_t hdr = __atomic_load_n((uint64_t *)eh, __ATOMIC_ACQUIRE);
-    uint8_t entry_tier = (uint8_t)(hdr >> 48);
-    uint8_t expected_entry_tier = want_tier == IR_TIER_T1 ? TIER_T1 : TIER_T0;
-    if (((uint8_t)(hdr >> 32)) == LK_OWNED && (uint8_t)hdr == gen &&
-        entry_tier == expected_entry_tier) {
-        uint8_t ng = (uint8_t)(hdr & 0xFF) + 1; if (ng == 0) ng = 1;
-        uint64_t nhdr = (hdr & ~0xFFull) | ng;               /* bump gen */
-        /* Tombstone: clear the KIND byte (bits 32..39) and KEEP the tier
-         * byte (bits 48..55). The old code cleared bits 48..55 — the tier —
-         * so the slot stayed LK_OWNED forever and the table leaked until
-         * interning started failing with SF_NULL. */
-        nhdr = (nhdr & ~(0xFFull << 32)) | ((uint64_t)LK_TOMB << 32);
-        __atomic_store_n((uint64_t *)eh, nhdr, __ATOMIC_RELEASE);
-        atomic_fetch_sub_explicit(&p->n_entries, 1, memory_order_relaxed);
-        atomic_fetch_add_explicit(&p->n_tombs, 1, memory_order_relaxed);
+    uint8_t ctrl = __atomic_load_n(&p->ctrl[pos], __ATOMIC_ACQUIRE);
+    if (ctrl != IP_CTRL_EMPTY && ctrl != IP_CTRL_DELETED) {
+        uint64_t sl = __atomic_load_n(&p->slots[pos], __ATOMIC_RELAXED);
+        if (IP_SLOT_GEN(sl) == gen && IP_SLOT_TIER(sl) == tier) {
+            uint8_t ng = (uint8_t)(IP_SLOT_GEN(sl) + 1); if (ng == 0) ng = 1;
+            uint64_t nsl = (sl & ~(0xFFull << 56)) | ((uint64_t)ng << 56);
+            __atomic_store_n(&p->slots[pos], nsl, __ATOMIC_RELAXED);
+            /* Tombstone: the slot stays part of the chain but no longer
+             * holds an entry. */
+            __atomic_store_n(&p->ctrl[pos], IP_CTRL_DELETED, __ATOMIC_RELEASE);
+            atomic_fetch_sub_explicit(&p->n_entries, 1, memory_order_relaxed);
+            atomic_fetch_add_explicit(&p->n_tombs, 1, memory_order_relaxed);
+        }
     }
     _seq_end(&p->seq);
     _unlock(&p->lock);
@@ -482,22 +590,23 @@ static const char *pool_str(Pool *p, SF_Handle h, uint32_t *len_out) {
     uint8_t  gen = _handle_gen(h);
     uint8_t  want_tier = _handle_tier(h);
     if (want_tier != IR_TIER_T0 && want_tier != IR_TIER_T1) return NULL;
-    Entry *eh = &p->headers[pos];
+    uint8_t tier = (want_tier == IR_TIER_T1) ? TIER_T1 : TIER_T0;
     const char *data;
+    uint32_t len = 0;
     uint32_t s0, s1;
     do {
         do { s0 = atomic_load_explicit(&p->seq, memory_order_acquire); }
         while (s0 & 1);
-        uint64_t hdr = __atomic_load_n((uint64_t *)eh, __ATOMIC_ACQUIRE);
-        uint64_t hdr1 = __atomic_load_n((uint64_t *)eh + 1, __ATOMIC_RELAXED);
-        uint8_t entry_tier = (uint8_t)(hdr >> 48);
-        if (((uint8_t)(hdr >> 32)) != LK_OWNED || (uint8_t)hdr != gen ||
-            entry_tier != (want_tier == IR_TIER_T1 ? TIER_T1 : TIER_T0))
-            return NULL;
-        data = (const char *)_entry_data_snapshot(p, hdr, hdr1);
-        if (len_out) *len_out = (uint32_t)hdr1;
+        uint8_t ctrl = __atomic_load_n(&p->ctrl[pos], __ATOMIC_ACQUIRE);
+        if (ctrl == IP_CTRL_EMPTY || ctrl == IP_CTRL_DELETED) return NULL;
+        uint64_t sl = __atomic_load_n(&p->slots[pos], __ATOMIC_RELAXED);
+        if (IP_SLOT_GEN(sl) != gen || IP_SLOT_TIER(sl) != tier) return NULL;
+        const uint8_t *base = _slot_base(p, sl);
+        len = ((const IpPrefix *)base)->len;
+        data = (const char *)(base + sizeof(IpPrefix));
         s1 = atomic_load_explicit(&p->seq, memory_order_acquire);
     } while (s0 != s1);
+    if (len_out) *len_out = len;
     return data;
 }
 
@@ -511,18 +620,17 @@ static uint32_t pool_epoch_end(Pool *p) {
     _lock(&p->lock);
     _seq_begin(&p->seq);
     for (uint32_t i = 0; i < p->M; i++) {
-        Entry *eh = &p->headers[i];
-        uint64_t hdr = __atomic_load_n((uint64_t *)eh, __ATOMIC_ACQUIRE);
-        if (((uint8_t)(hdr >> 32)) == LK_OWNED &&
-            (uint8_t)(hdr >> 48) == TIER_T0) {
-            uint8_t ng = (uint8_t)(hdr & 0xFF) + 1; if (ng == 0) ng = 1;
-            uint64_t nhdr = (hdr & ~0xFFull) | ng;
-            nhdr = (nhdr & ~(0xFFull << 32)) | ((uint64_t)LK_TOMB << 32);
-            __atomic_store_n((uint64_t *)eh, nhdr, __ATOMIC_RELEASE);
-            atomic_fetch_sub_explicit(&p->n_entries, 1, memory_order_relaxed);
-            atomic_fetch_add_explicit(&p->n_tombs, 1, memory_order_relaxed);
-            cleared++;
-        }
+        uint8_t ctrl = __atomic_load_n(&p->ctrl[i], __ATOMIC_ACQUIRE);
+        if (ctrl == IP_CTRL_EMPTY || ctrl == IP_CTRL_DELETED) continue;
+        uint64_t sl = __atomic_load_n(&p->slots[i], __ATOMIC_RELAXED);
+        if (IP_SLOT_TIER(sl) != TIER_T0) continue;
+        uint8_t ng = (uint8_t)(IP_SLOT_GEN(sl) + 1); if (ng == 0) ng = 1;
+        uint64_t nsl = (sl & ~(0xFFull << 56)) | ((uint64_t)ng << 56);
+        __atomic_store_n(&p->slots[i], nsl, __ATOMIC_RELAXED);
+        __atomic_store_n(&p->ctrl[i], IP_CTRL_DELETED, __ATOMIC_RELEASE);
+        atomic_fetch_sub_explicit(&p->n_entries, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&p->n_tombs, 1, memory_order_relaxed);
+        cleared++;
     }
     _arena_free(&p->t0);
     uint32_t cap = p->max_entries * IP_AVG_STRLEN;
