@@ -127,7 +127,7 @@ resolves to `NULL` — never to torn data.
 
 | Function | Notes |
 |----------|-------|
-| `HybridPool *hybrid_create(uint16_t base_pool_id, uint32_t expected_short, uint32_t expected_long)` | size hints, not limits; pool ids derive from `base_pool_id` |
+| `HybridPool *hybrid_create(uint16_t base_pool_id, uint32_t expected_short, uint32_t expected_long)` | size hints, not limits; pool ids derive from `base_pool_id`; returns `NULL` when `base_pool_id > HYBRID_INTERN_MAX_POOL_ID` (4095) or when a hint exceeds `HYBRID_INTERN_MAX_ENTRIES` (1M entries per pool) |
 | `SF_Handle hybrid_intern(HybridPool*, const char *s, uint32_t len)` | T1 stable — dedup, lives until destroy |
 | `SF_Handle hybrid_intern_scratch(HybridPool*, const char *s, uint32_t len)` | T0 — dropped in bulk at the epoch boundary |
 | `const char *hybrid_str(HybridPool*, SF_Handle, uint32_t *len_out)` | zero-copy; `len_out` may be `NULL`; `NULL` return = stale/invalid handle |
@@ -136,6 +136,23 @@ resolves to `NULL` — never to torn data.
 | `void hybrid_destroy(HybridPool*)` | frees both tiers and their arenas |
 | `HybridStats hybrid_stats(HybridPool*)`, `hybrid_print_stats(HybridPool*)` | entries/max/load per tier, long-pool collisions |
 | `HYBRID_SCOPED(name, id, short_n, long_n)` | block-scoped pool via the `cleanup` attribute |
+
+### Safety and lifetime limits
+
+- Handles are validated before table access. Out-of-range ranks, wrong-pool or
+  wrong-tier handles, and handles for free slots resolve to `NULL`; eviction
+  treats them as no-ops.
+- Intern lengths are 32-bit. Lengths above `HYBRID_INTERN_MAX_LEN` and null
+  pointers with a non-zero length are rejected with `SF_NULL`. The maximum is
+  `UINT32_MAX - 31`, leaving room for checked 32-byte arena rounding.
+- The size hints passed to `hybrid_create()` are bounded by
+  `HYBRID_INTERN_MAX_ENTRIES` (1M entries per pool). A larger hint returns
+  `NULL` instead of sizing a table from an overflowed product.
+- `hybrid_epoch_end()` is a reclamation boundary for T0 storage. Callers must
+  ensure no thread is still consuming a T0 pointer returned by `hybrid_str()`
+  when the boundary runs. The zero-copy pointer must not be used after that
+  boundary; use external quiescence (or a future pinned/copying API) when
+  readers and epoch boundaries can overlap.
 
 ### Quick start
 
@@ -164,7 +181,9 @@ guarded at the top of the header: `SHORT_MAX_LEN` (48), `LONG_LOAD_NUM` /
 Gate: `test_hybrid` — single-thread roundtrip/dedup/boundary sizes, 8 threads
 interning the same set concurrently (one handle per string, no duplicate
 intern), evict/gen invalidation, and evict-during-resolve (TOCTOU) churn
-against a small pool. See [Testing](#testing).
+against a small pool. `test_hybrid_security` adds malformed-handle,
+full-width-length, oversized-length, pool-id, and AVX2 boundary regressions
+under ASan/UBSan. See [Testing](#testing).
 
 ## Benchmarks vs the field
 
@@ -295,7 +314,7 @@ the pinning caveat above).
 
 ## Testing
 
-`make test` builds everything and runs the quality gate (8 binaries):
+`make test` builds everything and runs the quality gate (9 binaries):
 
 | Gate | What it checks |
 |------|----------------|
@@ -306,6 +325,7 @@ the pinning caveat above).
 | `test_edge` | path-boundary keys, pattern keys, tiny/long key extremes |
 | `test_extensive` | broad sanity/chi²/avalanche matrix + throughput spot checks |
 | `test_hybrid` | `hybrid_intern.h`: roundtrip/dedup/boundaries, 8-thread concurrent intern of one set, evict/gen invalidation, evict-during-resolve (TOCTOU) |
+| `test_hybrid_security` (ASan/UBSan) | malformed/out-of-range/tier-mismatched/free-slot handles, 65,536-byte length roundtrip/dedup, oversized-length rejection, invalid pool ids, AVX2 tail bounds |
 
 Standalone suite, built by `make all` and run by CI:
 

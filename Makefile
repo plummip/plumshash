@@ -11,7 +11,7 @@ CFLAGS   ?= -O3 -march=native -Wall -Wextra
 REF      := -Irefs -Irefs/t1ha -I.
 
 TESTS    := test_sanitize test_quality test_comb16 test_security test_headers \
-            smhasher_plums test_edge test_extensive test_hybrid
+            smhasher_plums test_edge test_extensive test_hybrid test_hybrid_security
 BENCHES  := bench_compete test_speed
 BINS     := $(TESTS) $(BENCHES)
 
@@ -48,6 +48,10 @@ test_extensive: test_extensive.c plumshash.h
 test_hybrid: test_hybrid.c plumshash.h hybrid_intern.h
 	$(CC) $(CFLAGS) -pthread -o $@ test_hybrid.c
 
+test_hybrid_security: test_hybrid_security.c plumshash.h hybrid_intern.h
+	$(CC) -O1 -g -march=native -pthread -fsanitize=address,undefined \
+		-fno-sanitize-recover=all -o $@ test_hybrid_security.c
+
 # ── benchmarks ───────────────────────────────────────────────────────────
 bench_compete: bench_compete.c plumshash.h refs/rapidhash.h refs/wyhash.h refs/xxhash.h refs/t1ha/t1ha2.c
 	$(CC) $(CFLAGS) $(REF) -o $@ bench_compete.c refs/t1ha/t1ha2.c
@@ -75,6 +79,7 @@ test: all
 	./test_edge | tail -1
 	./test_extensive | grep -E 'RESULTS' | tail -1
 	./test_hybrid | tail -1
+	ASAN_OPTIONS=detect_leaks=0 ./test_hybrid_security | tail -1
 
 # Benchmarks. `bench` writes the published min-of-7 tables to bench_results.txt
 # (gitignored) and then raw bandwidth from test_speed. Override the run count

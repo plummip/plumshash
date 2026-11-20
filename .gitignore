@@ -16,6 +16,7 @@ smhasher_plums
 test_edge
 test_extensive
 test_hybrid
+test_hybrid_security
 bench_compete
 test_speed
 bench_plums
